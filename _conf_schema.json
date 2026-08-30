@@ -11,9 +11,15 @@
     "type": "int",
     "default": 100
   },
+  "organize_provider": {
+    "description": "AI整理使用的模型供应商ID",
+    "hint": "留空=跟随当前对话供应商；可用 /mem models 查看、/mem model <供应商id> [模型名] 设置",
+    "type": "text",
+    "default": ""
+  },
   "organize_model": {
-    "description": "AI整理使用的模型",
-    "hint": "留空=跟随当前对话模型；填写模型名则整理时使用指定模型，如 deepseek-chat",
+    "description": "AI整理使用的模型名",
+    "hint": "留空=使用供应商默认模型；配合 organize_provider 使用",
     "type": "text",
     "default": ""
   },

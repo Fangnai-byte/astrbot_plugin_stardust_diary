@@ -130,7 +130,7 @@ class SmartMemory(Star):
             text = "\n".join(
                 f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
             )[:12000]
-            provider = await self.context.get_using_provider_async()
+            provider = await self._pick_provider()
             if provider is None:
                 return
             resp = await provider.text_chat(
@@ -180,6 +180,32 @@ class SmartMemory(Star):
             logger.info(f"[星尘手账] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
             logger.warning(f"[星尘手账] AI 整理失败: {e}")
+
+    def _pick_provider(self):
+        """按配置选择 AI 整理用的供应商；未配置则用当前对话模型。"""
+        try:
+            pid = str(self.config.get("organize_provider", "") or "")
+            if pid:
+                p = self.context.get_provider_by_id(pid)
+                if p is not None:
+                    return p
+                logger.warning(f"[星尘手账] 供应商 {pid} 不存在，改用当前模型")
+            return self.context.get_using_provider()
+        except Exception as e:
+            logger.warning(f"[星尘手账] 选择供应商失败: {e}")
+            return None
+
+    def _save_plugin_config(self) -> None:
+        """把当前 self.config 写回插件配置文件（指令修改配置时用）"""
+        try:
+            cfg_path = os.path.join(
+                get_astrbot_data_path(), "config",
+                "astrbot_plugin_stardust_diary_config.json",
+            )
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"[星尘手账] 保存插件配置失败: {e}")
 
     def _count_short(self, group_id: str) -> int:
         try:
@@ -386,6 +412,40 @@ class SmartMemory(Star):
                 yield event.plain_result(f"已删除记忆 [{mid}]：{row['content']}")
             except Exception as e:
                 yield event.plain_result(f"删除失败: {e}")
+            return
+
+        if sub == "models":
+            providers = self.context.get_all_providers()
+            if not providers:
+                yield event.plain_result("当前没有任何模型供应商哦～")
+                return
+            lines = ["可用模型供应商："]
+            for p in providers:
+                m = p.meta
+                lines.append(f"- {m.id}（{m.type}）当前模型：{m.model}")
+                try:
+                    models = await p.get_models()
+                    if models:
+                        shown = "、".join(models[:10])
+                        lines.append(f"  可选：{shown}")
+                except Exception:
+                    pass
+            lines.append("用 /mem model <供应商id> [模型名] 设置整理模型")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if sub == "model":
+            if len(args) < 3:
+                yield event.plain_result("用法：/mem model <供应商id> [模型名]，先 /mem models 查看")
+                return
+            pid = args[2]
+            model_name = args[3] if len(args) > 3 else ""
+            self.config["organize_provider"] = pid
+            self.config["organize_model"] = model_name
+            self._save_plugin_config()
+            yield event.plain_result(
+                f"整理模型已设为：{pid}" + (f" / {model_name}" if model_name else "（默认模型）")
+            )
             return
 
         if sub == "stat":
