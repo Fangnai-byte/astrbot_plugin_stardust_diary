@@ -1,0 +1,42 @@
+# 插件的唯一标识名 (不要改)
+name: astrbot_plugin_stardust_diary
+
+# 插件展示名
+display_name: 星尘手账 (Stardust Diary)
+
+# 插件的一句话简介
+desc: 自动判断群消息重要性，重要记忆长期保存，日常消息保留一天，需要时注入上下文。按群隔离。
+
+# 插件的详细帮助信息
+help: |
+  插件自动监听群消息：
+  1. 所有消息先进短期缓存（保留一天）
+  2. 疑似重要的消息由 LLM 判断，重要则保存为长期记忆（摘要+关键词）
+  3. 群聊触发 LLM 请求时，检索本群相关记忆注入上下文
+
+  指令：
+    /mem list [n]   - 查看本群最近 n 条长期记忆（默认10）
+    /mem recent [n] - 查看本群最近 n 条短期消息（默认10）
+    /mem forget <id> - 删除指定长期记忆（管理员可删任意，其他人只能删自己的）
+    /mem stat       - 查看记忆统计
+    /mem help       - 显示帮助
+
+# (可选) 插件 Logo 文件名（对应插件目录下的 logo.png）
+# 使用 GitHub 绝对链接，避免 Cloud 构建时资源不同步
+logo: "https://raw.githubusercontent.com/Fangnai-byte/astrbot_plugin_stardust_diary/main/logo.png"
+
+# (可选) 你的 GitHub 仓库地址
+repo: "https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary"
+
+# 插件版本号
+version: 1.0.0
+
+# 作者名
+author: Nene & Fangnai
+
+# 声明支持的平台
+support_platforms:
+  - aiocqhttp
+
+# 声明支持的 AstrBot 版本范围
+astrbot_version: ">=3.8.0"

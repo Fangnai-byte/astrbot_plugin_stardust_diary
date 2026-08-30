@@ -1,0 +1,32 @@
+{
+  "min_len": {
+    "description": "触发LLM判断的最小消息长度",
+    "hint": "消息长度小于该值时不调用LLM判断重要性，直接进短期缓存",
+    "type": "int",
+    "default": 10
+  },
+  "top_k": {
+    "description": "注入的长期记忆条数",
+    "hint": "每次LLM请求最多注入几条相关长期记忆",
+    "type": "int",
+    "default": 5
+  },
+  "include_recent": {
+    "description": "是否注入最近短期消息",
+    "hint": "开启后会在上下文里附带最近几条消息，帮助理解当前语境",
+    "type": "bool",
+    "default": true
+  },
+  "recent_count": {
+    "description": "注入的最近消息条数",
+    "hint": "include_recent 开启时生效",
+    "type": "int",
+    "default": 5
+  },
+  "judge_enabled": {
+    "description": "是否启用LLM重要性判断",
+    "hint": "关闭后所有消息只进短期缓存，不产生长期记忆",
+    "type": "bool",
+    "default": true
+  }
+}
