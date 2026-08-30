@@ -124,13 +124,16 @@ class SmartMemory(Star):
     async def _organize(self, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
         try:
+            logger.info(f"[星尘手账] _organize 被调用，群 {group_id}")
             msgs = self._all_short(group_id)
+            logger.info(f"[星尘手账] 群 {group_id} 缓冲 {len(msgs)} 条")
             if len(msgs) < int(self.config.get("organize_threshold", 100)):
                 return
             text = "\n".join(
                 f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
             )[:12000]
             provider = await self._pick_provider()
+            logger.info(f"[星尘手账] provider: {provider.meta.id if provider else None}")
             if provider is None:
                 return
             resp = await provider.text_chat(
@@ -148,7 +151,9 @@ class SmartMemory(Star):
             out = "".join(
                 [c.text for c in resp.result_chain if isinstance(c, Plain)]
             )
+            logger.info(f"[星尘手账] LLM 返回前100字: {out[:100]!r}")
             data = self._parse_json(out)
+            logger.info(f"[星尘手账] 解析结果: {bool(data)}")
             if not data:
                 return
             saved = 0
