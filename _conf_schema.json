@@ -18,6 +18,12 @@
     "_special": "select_provider",
     "default": ""
   },
+  "organize_prompt": {
+    "description": "AI整理前的额外提示词",
+    "hint": "可选。会追加在默认整理提示词之后，例如：注意保留群友之间的昵称对应关系",
+    "type": "text",
+    "default": ""
+  },
   "top_k": {
     "description": "注入的长期记忆条数",
     "hint": "检索到相关记忆时最多注入几条",

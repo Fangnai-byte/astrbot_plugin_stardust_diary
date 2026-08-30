@@ -43,6 +43,7 @@ class SmartMemory(Star):
         self.db_path = os.path.join(self.db_dir, "memory.db")
         self._init_db()
         self._cleanup_expired()
+        self._organizing: set = set()  # 正在整理的群，避免并发重复触发
 
     # ---------------- 数据库 ----------------
     def _conn(self) -> sqlite3.Connection:
@@ -123,6 +124,10 @@ class SmartMemory(Star):
     # ---------------- 满阈值 AI 整理 ----------------
     async def _organize(self, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
+        if group_id in self._organizing:
+            logger.info(f"[星尘手账] 群 {group_id} 正在整理中，跳过本次触发")
+            return
+        self._organizing.add(group_id)
         try:
             logger.info(f"[星尘手账] _organize 被调用，群 {group_id}")
             msgs = self._all_short(group_id)
@@ -146,10 +151,12 @@ class SmartMemory(Star):
                     "只输出一个JSON对象："
                     '{"profiles": [{"user": "昵称", "attrs": {"键": "值"}}], '
                     '"memories": [{"content": "要点", "keywords": ["关键词"]}]}'
+                    + (f"\n\n额外要求：{self.config.get('organize_prompt', '')}"
+                       if self.config.get("organize_prompt", "") else "")
                 ),
             )
             out = "".join(
-                [c.text for c in resp.result_chain if isinstance(c, Plain)]
+                [c.text for c in (resp.result_chain.chain if resp.result_chain else []) if isinstance(c, Plain)]
             )
             logger.info(f"[星尘手账] LLM 返回前100字: {out[:100]!r}")
             data = self._parse_json(out)
@@ -184,6 +191,8 @@ class SmartMemory(Star):
             logger.info(f"[星尘手账] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
             logger.warning(f"[星尘手账] AI 整理失败: {e}")
+        finally:
+            self._organizing.discard(group_id)
 
     def _pick_provider(self):
         """按配置选择 AI 整理用的供应商；未配置则用当前对话模型。"""
