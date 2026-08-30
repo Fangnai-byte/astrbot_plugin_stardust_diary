@@ -17,9 +17,6 @@ import time
 from contextlib import closing
 from datetime import datetime
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType, PermissionType
@@ -36,24 +33,6 @@ except ImportError:  # 兼容旧版本 AstrBot
 
 
 # 命中这些词的消息才值得交给 LLM 判断（节省 token）
-TRIGGER_KEYWORDS = [
-    "记住", "记得", "喜欢", "讨厌", "我是", "我叫", "我的名字", "生日",
-    "约定", "答应", "打算", "计划", "秘密", "年龄", "考试", "作业",
-    "买了", "毕业", "工作", "学校", "最喜欢", "最讨厌", "以后",
-    "重要", "别忘了", "提醒", "不要", "希望",
-]
-
-JUDGE_SYSTEM_PROMPT = (
-    "你是一个群聊记忆筛选器。根据给定的群聊消息，判断它是否值得长期记住。"
-    "值得记住的情况举例：个人信息（名字/年龄/生日/喜好/忌口）、重要约定与承诺、"
-    "重大事件（考试/毕业/换工作/生病/搬家）、长期计划、群友之间的重要关系。"
-    "普通闲聊、吐槽、无信息量的寒暄等属于不重要。"
-    "只输出一个 JSON 对象，不要输出任何其他文字，格式："
-    '{"important": true或false, "summary": "一句话中文摘要", "keywords": ["关键词1", "关键词2"]}'
-    "若 important 为 false，summary 为空字符串，keywords 为空数组。"
-)
-
-
 class SmartMemory(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -64,19 +43,6 @@ class SmartMemory(Star):
         self.db_path = os.path.join(self.db_dir, "memory.db")
         self._init_db()
         self._cleanup_expired()
-        # 每日总结定时任务
-        self.scheduler = AsyncIOScheduler()
-        try:
-            hh, mm = str(self.config.get("summary_time", "23:55")).split(":")
-            self.scheduler.add_job(
-                self._daily_summary_job,
-                CronTrigger(hour=int(hh), minute=int(mm)),
-                id="stardust_daily_summary",
-            )
-            self.scheduler.start()
-            logger.info(f"[星尘手账] 每日总结定时任务已启动：{hh}:{mm}")
-        except Exception as e:
-            logger.warning(f"[星尘手账] 定时任务启动失败: {e}")
 
     # ---------------- 数据库 ----------------
     def _conn(self) -> sqlite3.Connection:
@@ -143,31 +109,39 @@ class SmartMemory(Star):
         user_id = str(event.get_sender_id())
         user_name = event.get_sender_name() or user_id
 
-        # 1. 全部消息进短期缓存，保留一天
+        # 1. 消息进短期缓冲
         self._add_short(group_id, user_id, user_name, text)
 
-        # 2. 疑似重要才交给 LLM 判断（异步，不阻塞回复）
-        if self.config.get("judge_enabled", True) and self._should_judge(text):
-            asyncio.create_task(
-                self._judge_and_store(group_id, user_id, user_name, text)
-            )
+        # 2. 满阈值触发 AI 整理（异步，不阻塞回复）
+        if self.config.get("organize_enabled", True):
+            n = self._count_short(group_id)
+            if n >= int(self.config.get("organize_threshold", 100)):
+                asyncio.create_task(self._organize(group_id))
 
-    def _should_judge(self, text: str) -> bool:
-        if len(text) < int(self.config.get("min_len", 10)):
-            return False
-        return any(kw in text for kw in TRIGGER_KEYWORDS)
-
-    # ---------------- LLM 重要性判断 ----------------
-    async def _judge_and_store(
-        self, group_id: str, user_id: str, user_name: str, text: str
-    ):
+    # ---------------- 满阈值 AI 整理 ----------------
+    async def _organize(self, group_id: str):
+        """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
         try:
+            msgs = self._all_short(group_id)
+            if len(msgs) < int(self.config.get("organize_threshold", 100)):
+                return
+            text = "\n".join(
+                f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
+            )[:12000]
             provider = await self.context.get_using_provider_async()
             if provider is None:
                 return
             resp = await provider.text_chat(
                 prompt=text,
-                system_prompt=JUDGE_SYSTEM_PROMPT,
+                system_prompt=(
+                    "你是群聊档案管理员。根据聊天记录做两件事：\n"
+                    "1. 为活跃成员建立人物画像，用键值对记录稳定属性（如 生日/喜欢/讨厌/身份/口头禅），"
+                    "只记录明确出现过的信息，不要编造。\n"
+                    "2. 提取值得长期记住的要点（约定、事件、计划、重要信息）。\n"
+                    "只输出一个JSON对象："
+                    '{"profiles": [{"user": "昵称", "attrs": {"键": "值"}}], '
+                    '"memories": [{"content": "要点", "keywords": ["关键词"]}]}'
+                ),
             )
             out = "".join(
                 [c.text for c in resp.result_chain if isinstance(c, Plain)]
@@ -175,92 +149,64 @@ class SmartMemory(Star):
             data = self._parse_json(out)
             if not data:
                 return
-            if data.get("important"):
-                summary = (data.get("summary") or text).strip()[:200]
-                keywords = data.get("keywords") or []
-                self._add_long(group_id, user_id, user_name, summary, keywords, text)
-                logger.info(f"[SmartMemory] 已保存长期记忆: {summary}")
-        except Exception as e:
-            logger.warning(f"[SmartMemory] 重要性判断失败: {e}")
-
-    @staticmethod
-    def _parse_json(s: str):
-        s = (s or "").strip()
-        m = re.search(r"\{.*\}", s, re.S)  # 容忍 ```json 包裹或前后废话
-        if m:
-            s = m.group(0)
-        try:
-            return json.loads(s)
-        except Exception:
-            return None
-
-    # ---------------- 每日总结 ----------------
-    async def _daily_summary_job(self):
-        try:
-            groups = self._groups_today()
-            if not groups:
-                logger.info("[星尘手账] 今日无消息，跳过总结")
-                return
-            today = datetime.now().strftime("%m-%d")
-            for gid in groups:
-                msgs = self._today_msgs(gid, limit=150)
-                if not msgs:
+            saved = 0
+            # 人物画像
+            for p in data.get("profiles") or []:
+                uname = str(p.get("user", "")).strip() or "未知"
+                attrs = p.get("attrs") or {}
+                if not attrs:
                     continue
-                text = "\
-".join(
-                    f"{r['user_name']}: {r['content']}" for r in msgs
-                )[:6000]
-                provider = await self.context.get_using_provider_async()
-                if provider is None:
-                    continue
-                resp = await provider.text_chat(
-                    prompt=text,
-                    system_prompt=(
-                        "你是群聊日报编辑。根据给定聊天记录提炼最多"
-                        f"{int(self.config.get('summary_max_points', 5))}条要点日报，"
-                        "覆盖重要话题、群友动态、值得记住的事，忽略灌水闲聊。"
-                        '只输出JSON：{"points": ["1. ...", "2. ..."]}'
-                    ),
-                )
-                out = "".join(
-                    [c.text for c in resp.result_chain if isinstance(c, Plain)]
-                )
-                data = self._parse_json(out)
-                if not data or not data.get("points"):
-                    continue
-                points = [str(p).strip() for p in data["points"]][
-                    : int(self.config.get("summary_max_points", 5))
-                ]
-                summary = f"【日报 {today}】" + "；".join(points)
+                kv = "；".join(f"{k}={v}" for k, v in attrs.items())
                 self._add_long(
-                    gid, "system", "星尘手账日报", summary,
-                    ["日报", "总结"], f"每日总结 {today}",
+                    group_id, "system", uname, f"【画像】{uname}：{kv}",
+                    [uname] + list(attrs.keys()), "人物画像",
                 )
-                logger.info(f"[星尘手账] 群 {gid} 日报已生成")
+                saved += 1
+            # 要点记忆
+            for m in data.get("memories") or []:
+                content = str(m.get("content", "")).strip()
+                if not content:
+                    continue
+                self._add_long(
+                    group_id, "system", "星尘手账", content[:200],
+                    m.get("keywords") or [], "要点提取",
+                )
+                saved += 1
+            # 清空缓冲，重新计数
+            self._clear_short(group_id)
+            logger.info(f"[星尘手账] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
-            logger.warning(f"[星尘手账] 每日总结失败: {e}")
+            logger.warning(f"[星尘手账] AI 整理失败: {e}")
 
-    def _groups_today(self):
-        try:
-            with closing(self._conn()) as conn:
-                rows = conn.execute(
-                    "SELECT DISTINCT group_id FROM short_term WHERE created_at >= ?",
-                    (time.time() - 86400,),
-                ).fetchall()
-            return [r[0] for r in rows]
-        except Exception:
-            return []
-
-    def _today_msgs(self, group_id: str, limit: int = 150):
+    def _count_short(self, group_id: str) -> int:
         try:
             with closing(self._conn()) as conn:
                 return conn.execute(
-                    "SELECT * FROM short_term WHERE group_id = ? AND created_at >= ? "
+                    "SELECT COUNT(*) FROM short_term WHERE group_id = ?",
+                    (group_id,),
+                ).fetchone()[0]
+        except Exception:
+            return 0
+
+    def _all_short(self, group_id: str, limit: int = 500):
+        try:
+            with closing(self._conn()) as conn:
+                return conn.execute(
+                    "SELECT * FROM short_term WHERE group_id = ? "
                     "ORDER BY created_at ASC LIMIT ?",
-                    (group_id, time.time() - 86400, limit),
+                    (group_id, limit),
                 ).fetchall()
         except Exception:
             return []
+
+    def _clear_short(self, group_id: str):
+        try:
+            with closing(self._conn()) as conn, conn:
+                conn.execute(
+                    "DELETE FROM short_term WHERE group_id = ?", (group_id,)
+                )
+        except Exception as e:
+            logger.warning(f"[星尘手账] 清空缓冲失败: {e}")
 
     # ---------------- 存储 ----------------
     def _add_short(self, group_id, user_id, user_name, text):

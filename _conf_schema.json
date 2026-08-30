@@ -1,43 +1,31 @@
 {
-  "min_len": {
-    "description": "触发LLM判断的最小消息长度",
-    "hint": "消息长度小于该值时不调用LLM判断重要性，直接进短期缓存",
+  "organize_enabled": {
+    "description": "是否启用满阈值AI整理",
+    "hint": "关闭后消息只进短期缓冲，不产生长期记忆",
+    "type": "bool",
+    "default": true
+  },
+  "organize_threshold": {
+    "description": "触发整理的消息条数",
+    "hint": "每个群攒满这么多条消息后，AI自动提炼人物画像与要点存入长期记忆，并清空缓冲",
     "type": "int",
-    "default": 10
+    "default": 100
   },
   "top_k": {
     "description": "注入的长期记忆条数",
-    "hint": "每次LLM请求最多注入几条相关长期记忆",
+    "hint": "检索到相关记忆时最多注入几条",
     "type": "int",
     "default": 5
   },
   "include_recent": {
-    "description": "是否注入最近短期消息",
-    "hint": "开启后会在上下文里附带最近几条消息，帮助理解当前语境",
+    "description": "是否注入缓冲中的最近消息",
+    "hint": "开启后会在上下文附带缓冲中最近几条消息，帮助理解当前语境",
     "type": "bool",
     "default": true
   },
   "recent_count": {
     "description": "注入的最近消息条数",
     "hint": "include_recent 开启时生效",
-    "type": "int",
-    "default": 5
-  },
-  "judge_enabled": {
-    "description": "是否启用LLM重要性判断",
-    "hint": "关闭后所有消息只进短期缓存，不产生长期记忆",
-    "type": "bool",
-    "default": true
-  },
-  "summary_time": {
-    "description": "每日总结时间",
-    "hint": "每天该时刻把当天群聊总结成日报存入长期记忆，格式 HH:MM",
-    "type": "text",
-    "default": "23:55"
-  },
-  "summary_max_points": {
-    "description": "日报最多要点条数",
-    "hint": "每日总结最多提炼几条要点",
     "type": "int",
     "default": 5
   }
