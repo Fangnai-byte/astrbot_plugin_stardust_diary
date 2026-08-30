@@ -15,7 +15,7 @@ import re
 import sqlite3
 import time
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -336,6 +336,41 @@ class SmartMemory(Star):
         s = re.sub(r"\s+", "", s or "")
         return {s[i:i + n] for i in range(max(0, len(s) - n + 1))}
 
+    def _since_ts(self, level: str) -> float:
+        """分层时间起点：L1长期全部 / L2今天 / L3最近三天 / L4本周一。"""
+        now = datetime.now()
+        if level == "L2":
+            return datetime(now.year, now.month, now.day).timestamp()
+        if level == "L3":
+            return (now - timedelta(days=3)).timestamp()
+        if level == "L4":
+            week_start = (now - timedelta(days=now.weekday())).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            return week_start.timestamp()
+        return 0.0  # L1：全部长期记忆
+
+    def _detect_time_intent(self, query: str) -> str | None:
+        """根据提问内容判断时间层级意图。"""
+        if any(k in query for k in ("今天", "刚才", "今早", "今晚", "早上", "下午", "中午", "晚上")):
+            return "L2"
+        if any(k in query for k in ("最近", "这两天", "这几天", "前两天", "前天", "昨天")):
+            return "L3"
+        if any(k in query for k in ("本周", "这周", "这星期", "这个星期", "星期", "一周")):
+            return "L4"
+        return None
+
+    def _recent_short_since(self, group_id: str, since_ts: float, n: int = 10):
+        try:
+            with closing(self._conn()) as conn:
+                return conn.execute(
+                    "SELECT * FROM short_term WHERE group_id = ? AND created_at >= ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (group_id, since_ts, n),
+                ).fetchall()
+        except Exception:
+            return []
+
     def _recent_short(self, group_id: str, n: int = 10):
         try:
             with closing(self._conn()) as conn:
@@ -367,8 +402,25 @@ class SmartMemory(Star):
                     when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
                     lines.append(f"- ({when} {r['user_name']}) {r['content']}")
                 parts.append("【记忆片段，来自本群历史消息，可参考但勿编造】\n" + "\n".join(lines))
-            # 最近短期消息
-            if self.config.get("include_recent", True):
+            # 分层短期记忆：识别提问的时间意图（L2今天/L3最近几天/L4本周）
+            level = self._detect_time_intent(query)
+            if level:
+                since = self._since_ts(level)
+                n = int(self.config.get("recent_count", 5)) * 2
+                rows = self._recent_short_since(group_id, since, n)
+                label = {"L2": "今天", "L3": "最近几天", "L4": "本周"}.get(level, level)
+                if rows:
+                    lines = [
+                        f"- {r['user_name']}: {r['content']}" for r in reversed(rows)
+                    ]
+                    parts.append(f"【{label}的群聊记录，用户可能问的是这段时间的事】\n" + "\n".join(lines))
+                # 关键词追问引导
+                parts.append(
+                    "【检索提示】若用户询问时间段内发生的事情但描述模糊，"
+                    "请先引导用户说出更具体的关键词（人名/话题/事件），"
+                    "再根据关键词检索上面的记忆和【记忆片段】后回答，不要凭空编造。"
+                )
+            elif self.config.get("include_recent", True):
                 n = int(self.config.get("recent_count", 5))
                 recent = self._recent_short(group_id, n)
                 if recent:
