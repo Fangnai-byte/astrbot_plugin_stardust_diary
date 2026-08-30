@@ -12,9 +12,10 @@
     "default": 100
   },
   "organize_provider": {
-    "description": "AI整理使用的模型供应商ID",
-    "hint": "留空=跟随当前对话供应商；可用 /mem models 查看、/mem model <供应商id> [模型名] 设置",
-    "type": "text",
+    "description": "AI整理使用的模型提供商",
+    "hint": "留空则跟随当前对话模型；也可用 /mem models、/mem model 查看和设置",
+    "type": "string",
+    "_special": "select_provider",
     "default": ""
   },
   "organize_model": {
