@@ -125,20 +125,20 @@ class SmartMemory(Star):
     async def _organize(self, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
         if group_id in self._organizing:
-            logger.info(f"[星尘手账] 群 {group_id} 正在整理中，跳过本次触发")
+            self._log(f"[星尘手账] 群 {group_id} 正在整理中，跳过本次触发")
             return
         self._organizing.add(group_id)
         try:
-            logger.info(f"[星尘手账] _organize 被调用，群 {group_id}")
+            self._log(f"[星尘手账] _organize 被调用，群 {group_id}")
             msgs = self._all_short(group_id)
-            logger.info(f"[星尘手账] 群 {group_id} 缓冲 {len(msgs)} 条")
+            self._log(f"[星尘手账] 群 {group_id} 缓冲 {len(msgs)} 条")
             if len(msgs) < int(self.config.get("organize_threshold", 100)):
                 return
             text = "\n".join(
                 f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
             )[:12000]
             provider = self._pick_provider()
-            logger.info(f"[星尘手账] provider: {provider.meta().id if provider else None}")
+            self._log(f"[星尘手账] provider: {provider.meta().id if provider else None}")
             if provider is None:
                 return
             resp = await provider.text_chat(
@@ -158,9 +158,9 @@ class SmartMemory(Star):
             out = "".join(
                 [c.text for c in (resp.result_chain.chain if resp.result_chain else []) if isinstance(c, Plain)]
             )
-            logger.info(f"[星尘手账] LLM 返回前100字: {out[:100]!r}")
+            self._log(f"[星尘手账] LLM 返回前100字: {out[:100]!r}")
             data = self._parse_json(out)
-            logger.info(f"[星尘手账] 解析结果: {bool(data)}")
+            self._log(f"[星尘手账] 解析结果: {bool(data)}")
             if not data:
                 return
             saved = 0
@@ -188,11 +188,31 @@ class SmartMemory(Star):
                 saved += 1
             # 清空缓冲，重新计数
             self._clear_short(group_id)
-            logger.info(f"[星尘手账] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
+            self._log(f"[星尘手账] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
-            logger.warning(f"[星尘手账] AI 整理失败: {e}")
+            self._log(f"[星尘手账] AI 整理失败: {e}")
         finally:
             self._organizing.discard(group_id)
+
+    def _log(self, msg: str):
+        """双写日志：astrbot 日志 + 独立文件（防 group_log_archive 清空源日志丢失）"""
+        try:
+            with open(os.path.join(self.db_dir, "plugin.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_json(s: str):
+        """从 LLM 输出中提取 JSON 对象（容忍 markdown 包裹或前后废话）。"""
+        s = (s or "").strip()
+        m = re.search(r"\{.*\}", s, re.S)
+        if m:
+            s = m.group(0)
+        try:
+            return json.loads(s)
+        except Exception:
+            return None
 
     def _pick_provider(self):
         """按配置选择 AI 整理用的供应商；未配置则用当前对话模型。"""
