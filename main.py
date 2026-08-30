@@ -144,6 +144,7 @@ class SmartMemory(Star):
                     '{"profiles": [{"user": "昵称", "attrs": {"键": "值"}}], '
                     '"memories": [{"content": "要点", "keywords": ["关键词"]}]}'
                 ),
+                model=self.config.get("organize_model") or None,
             )
             out = "".join(
                 [c.text for c in resp.result_chain if isinstance(c, Plain)]

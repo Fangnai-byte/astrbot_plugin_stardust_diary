@@ -11,6 +11,12 @@
     "type": "int",
     "default": 100
   },
+  "organize_model": {
+    "description": "AI整理使用的模型",
+    "hint": "留空=跟随当前对话模型；填写模型名则整理时使用指定模型，如 deepseek-chat",
+    "type": "text",
+    "default": ""
+  },
   "top_k": {
     "description": "注入的长期记忆条数",
     "hint": "检索到相关记忆时最多注入几条",
