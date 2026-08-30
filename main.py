@@ -46,7 +46,9 @@ class SmartMemory(Star):
 
     # ---------------- 数据库 ----------------
     def _conn(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path, timeout=10)
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        return conn
 
     def _init_db(self):
         with closing(self._conn()) as conn, conn:
