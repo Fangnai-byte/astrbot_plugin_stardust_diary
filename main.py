@@ -133,7 +133,7 @@ class SmartMemory(Star):
                 f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
             )[:12000]
             provider = self._pick_provider()
-            logger.info(f"[星尘手账] provider: {provider.meta.id if provider else None}")
+            logger.info(f"[星尘手账] provider: {provider.meta().id if provider else None}")
             if provider is None:
                 return
             resp = await provider.text_chat(
