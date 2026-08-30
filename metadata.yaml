@@ -5,7 +5,7 @@ name: astrbot_plugin_stardust_diary
 display_name: 星尘手账 (Stardust Diary)
 
 # 插件的一句话简介
-desc: 自动判断群消息重要性，重要记忆长期保存，日常消息保留一天，需要时注入上下文。按群隔离。
+desc: 自动判断群消息重要性，重要记忆长期保存，日常消息保留一天，每日自动总结日报，需要时注入上下文。按群隔离。
 
 # 插件的详细帮助信息
 help: |
@@ -29,7 +29,7 @@ logo: "https://raw.githubusercontent.com/Fangnai-byte/astrbot_plugin_stardust_di
 repo: "https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary"
 
 # 插件版本号
-version: 1.0.0
+version: 1.1.0
 
 # 作者名
 author: Nene & Fangnai

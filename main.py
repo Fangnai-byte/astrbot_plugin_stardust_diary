@@ -17,6 +17,9 @@ import time
 from contextlib import closing
 from datetime import datetime
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType, PermissionType
@@ -61,6 +64,19 @@ class SmartMemory(Star):
         self.db_path = os.path.join(self.db_dir, "memory.db")
         self._init_db()
         self._cleanup_expired()
+        # 每日总结定时任务
+        self.scheduler = AsyncIOScheduler()
+        try:
+            hh, mm = str(self.config.get("summary_time", "23:55")).split(":")
+            self.scheduler.add_job(
+                self._daily_summary_job,
+                CronTrigger(hour=int(hh), minute=int(mm)),
+                id="stardust_daily_summary",
+            )
+            self.scheduler.start()
+            logger.info(f"[星尘手账] 每日总结定时任务已启动：{hh}:{mm}")
+        except Exception as e:
+            logger.warning(f"[星尘手账] 定时任务启动失败: {e}")
 
     # ---------------- 数据库 ----------------
     def _conn(self) -> sqlite3.Connection:
@@ -177,6 +193,74 @@ class SmartMemory(Star):
             return json.loads(s)
         except Exception:
             return None
+
+    # ---------------- 每日总结 ----------------
+    async def _daily_summary_job(self):
+        try:
+            groups = self._groups_today()
+            if not groups:
+                logger.info("[星尘手账] 今日无消息，跳过总结")
+                return
+            today = datetime.now().strftime("%m-%d")
+            for gid in groups:
+                msgs = self._today_msgs(gid, limit=150)
+                if not msgs:
+                    continue
+                text = "\
+".join(
+                    f"{r['user_name']}: {r['content']}" for r in msgs
+                )[:6000]
+                provider = await self.context.get_using_provider_async()
+                if provider is None:
+                    continue
+                resp = await provider.text_chat(
+                    prompt=text,
+                    system_prompt=(
+                        "你是群聊日报编辑。根据给定聊天记录提炼最多"
+                        f"{int(self.config.get('summary_max_points', 5))}条要点日报，"
+                        "覆盖重要话题、群友动态、值得记住的事，忽略灌水闲聊。"
+                        '只输出JSON：{"points": ["1. ...", "2. ..."]}'
+                    ),
+                )
+                out = "".join(
+                    [c.text for c in resp.result_chain if isinstance(c, Plain)]
+                )
+                data = self._parse_json(out)
+                if not data or not data.get("points"):
+                    continue
+                points = [str(p).strip() for p in data["points"]][
+                    : int(self.config.get("summary_max_points", 5))
+                ]
+                summary = f"【日报 {today}】" + "；".join(points)
+                self._add_long(
+                    gid, "system", "星尘手账日报", summary,
+                    ["日报", "总结"], f"每日总结 {today}",
+                )
+                logger.info(f"[星尘手账] 群 {gid} 日报已生成")
+        except Exception as e:
+            logger.warning(f"[星尘手账] 每日总结失败: {e}")
+
+    def _groups_today(self):
+        try:
+            with closing(self._conn()) as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT group_id FROM short_term WHERE created_at >= ?",
+                    (time.time() - 86400,),
+                ).fetchall()
+            return [r[0] for r in rows]
+        except Exception:
+            return []
+
+    def _today_msgs(self, group_id: str, limit: int = 150):
+        try:
+            with closing(self._conn()) as conn:
+                return conn.execute(
+                    "SELECT * FROM short_term WHERE group_id = ? AND created_at >= ? "
+                    "ORDER BY created_at ASC LIMIT ?",
+                    (group_id, time.time() - 86400, limit),
+                ).fetchall()
+        except Exception:
+            return []
 
     # ---------------- 存储 ----------------
     def _add_short(self, group_id, user_id, user_name, text):
