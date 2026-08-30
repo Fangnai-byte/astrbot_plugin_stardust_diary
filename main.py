@@ -144,7 +144,6 @@ class SmartMemory(Star):
                     '{"profiles": [{"user": "昵称", "attrs": {"键": "值"}}], '
                     '"memories": [{"content": "要点", "keywords": ["关键词"]}]}'
                 ),
-                model=self.config.get("organize_model") or None,
             )
             out = "".join(
                 [c.text for c in resp.result_chain if isinstance(c, Plain)]
@@ -430,22 +429,18 @@ class SmartMemory(Star):
                         lines.append(f"  可选：{shown}")
                 except Exception:
                     pass
-            lines.append("用 /mem model <供应商id> [模型名] 设置整理模型")
+            lines.append("用 /mem model <供应商id> 设置整理用提供商")
             yield event.plain_result("\n".join(lines))
             return
 
         if sub == "model":
             if len(args) < 3:
-                yield event.plain_result("用法：/mem model <供应商id> [模型名]，先 /mem models 查看")
+                yield event.plain_result("用法：/mem model <供应商id>，先 /mem models 查看")
                 return
             pid = args[2]
-            model_name = args[3] if len(args) > 3 else ""
             self.config["organize_provider"] = pid
-            self.config["organize_model"] = model_name
             self._save_plugin_config()
-            yield event.plain_result(
-                f"整理模型已设为：{pid}" + (f" / {model_name}" if model_name else "（默认模型）")
-            )
+            yield event.plain_result(f"AI整理提供商已设为：{pid}")
             return
 
         if sub == "stat":

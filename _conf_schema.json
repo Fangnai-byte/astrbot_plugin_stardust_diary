@@ -18,12 +18,6 @@
     "_special": "select_provider",
     "default": ""
   },
-  "organize_model": {
-    "description": "AI整理使用的模型名",
-    "hint": "留空=使用供应商默认模型；配合 organize_provider 使用",
-    "type": "text",
-    "default": ""
-  },
   "top_k": {
     "description": "注入的长期记忆条数",
     "hint": "检索到相关记忆时最多注入几条",
