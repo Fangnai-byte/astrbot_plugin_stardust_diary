@@ -22,6 +22,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType, PermissionType
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
+from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import Plain
 from astrbot.core.platform.message_type import MessageType
 
@@ -429,7 +430,10 @@ class SmartMemory(Star):
                     ]
                     parts.append("【最近消息，可能与本条相关】\n" + "\n".join(lines))
             if parts:
-                req.system_prompt = (req.system_prompt or "").rstrip() + "\n\n" + "\n\n".join(parts)
+                # 注入到用户消息之后而非 system_prompt，保持前缀稳定，缓存才能命中
+                req.extra_user_content_parts.append(
+                    TextPart(text="\n\n".join(parts))
+                )
         except Exception as e:
             logger.warning(f"[SmartMemory] 注入记忆失败: {e}")
 
