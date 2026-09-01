@@ -98,7 +98,9 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 清理过期短期记忆失败: {e}")
 
     # ---------------- 消息监听 ----------------
-    @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
+    @filter.event_message_type(
+        EventMessageType.GROUP_MESSAGE | EventMessageType.PRIVATE_MESSAGE
+    )
     async def on_group_message(self, event: AstrMessageEvent):
         # 忽略 bot 自己的消息，避免自我循环
         if str(event.get_sender_id()) == str(event.get_self_id()):
@@ -109,7 +111,7 @@ class SmartMemory(Star):
         # 插件自身指令不参与记忆
         if text.startswith("/mem"):
             return
-        group_id = str(event.get_group_id())
+        group_id = self._get_scope(event)
         user_id = str(event.get_sender_id())
         user_name = event.get_sender_name() or user_id
 
@@ -202,6 +204,15 @@ class SmartMemory(Star):
                 f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
         except Exception:
             pass
+
+    def _get_scope(self, event: AstrMessageEvent) -> str:
+        """作用域：群聊用群号，私聊用 priv_<对方QQ>，互不串扰。"""
+        mtype = event.get_message_type()
+        if mtype == MessageType.GROUP_MESSAGE:
+            return str(event.get_group_id())
+        if mtype == MessageType.FRIEND_MESSAGE:
+            return "priv_" + str(event.get_sender_id())
+        return "priv_" + str(event.get_sender_id())
 
     @staticmethod
     def _parse_json(s: str):
@@ -387,9 +398,9 @@ class SmartMemory(Star):
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
-            if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            if event.get_message_type() not in (MessageType.GROUP_MESSAGE, MessageType.FRIEND_MESSAGE):
                 return
-            group_id = str(event.get_group_id())
+            group_id = self._get_scope(event)
             query = event.get_message_str().strip()
             if not query:
                 return
@@ -442,7 +453,7 @@ class SmartMemory(Star):
     async def mem(self, event: AstrMessageEvent):
         args = (event.message_str or "").split()
         sub = args[1].strip().lower() if len(args) > 1 else "help"
-        group_id = str(event.get_group_id())
+        group_id = self._get_scope(event)
         user_id = str(event.get_sender_id())
 
         if sub == "list":

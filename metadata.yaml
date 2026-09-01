@@ -5,7 +5,7 @@ name: astrbot_plugin_stardust_diary
 display_name: 星尘手账 (Stardust Diary)
 
 # 插件的一句话简介
-desc: 每群攒满100条消息后AI自动整理：提炼人物画像键值与要点存入长期记忆，平时不动，检索到相关时才注入上下文。按群隔离。
+desc: 群聊与私聊均可使用：攒满100条消息后AI自动整理，提炼人物画像键值与要点存入长期记忆，平时不动，检索到相关时才注入上下文。按会话隔离。
 
 # 插件的详细帮助信息
 help: |
@@ -29,7 +29,7 @@ logo: "https://raw.githubusercontent.com/Fangnai-byte/astrbot_plugin_stardust_di
 repo: "https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary"
 
 # 插件版本号
-version: 1.4.1
+version: 1.5.0
 
 # 作者名
 author: 綾地 寧々&Fangnai-byte
