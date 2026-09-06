@@ -2,7 +2,7 @@
 
 ![logo](logo.png)
 
-一个 [AstrBot](https://github.com/Soulter/AstrBot) 智能记忆插件：每群攒满 **100 条消息**后，AI 自动整理出**人物画像（键值对）**与**重要要点**存入长期记忆；平时记忆纹丝不动，只有群聊内容检索到相关时才注入上下文。**按群隔离**，群与群之间互不可见。
+一个 [AstrBot](https://github.com/Soulter/AstrBot) 智能记忆插件：每群攒满 **100 条消息**后，AI 自动整理出**人物画像（键值对）**与**重要要点**存入长期记忆；平时记忆纹丝不动，只有群聊内容检索到相关时才注入上下文。**按群隔离**，群与群之间互不可见；**按 bot 实例分库**，多开账号各自独立、互不串记忆。
 
 ## 功能
 
@@ -12,6 +12,10 @@
   - **要点记忆**：约定、事件、计划等重要信息（带关键词）
 - **按需注入**：长期记忆平时不动，群聊内容与记忆关键词/内容匹配时才按相关度排序取 top N 条注入上下文，用完即收
 - **L1~L4 分层记忆**：识别提问时间意图（今天/最近几天/本周），自动注入对应层级的群聊记录；描述模糊时引导对方给出关键词再精准检索
+- **私聊记忆**：私聊按会话独立记忆（作用域 `priv_<对方QQ>`），与群聊互不串扰
+- **按 bot 实例分库**：数据库按 `memory_<self_id>.db` 拆分，一台 AstrBot 挂多个账号也各自独立
+- **本人档案兜底注入**：问"你记得我吗/我平时怎样"等关系类问题时，自动注入提问者本人的画像与记忆
+- **繁简归一化检索**：繁体提问自动转简体后匹配关键词，港台用语也能命中
 - **整理后清空缓冲**：避免重复整理，重新计数
 - **按群隔离**：每个群的记忆独立存储、独立检索，互不串群
 - **可选整理提供商**：配置界面直接下拉选择 AstrBot 中已配置的模型提供商，或用指令查看/设置
@@ -39,16 +43,17 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 
 ## 使用
 
-发送指令（群聊）：
+发送指令（群聊；`/mem` 相关指令在私聊也可用，记忆存于对应私聊会话）：
 
 ```
-/mem list [n]    # 查看本群最近 n 条长期记忆（默认 10）
-/mem recent [n]  # 查看缓冲中的最近 n 条消息（默认 10）
-/mem forget <id> # 删除指定长期记忆（管理员可删任意，其他人只能删自己的）
-/mem models      # 列出 AstrBot 所有模型提供商
+/mem list [n]        # 查看本会话最近 n 条长期记忆（默认 10）
+/mem recent [n]      # 查看缓冲中的最近 n 条消息（默认 10）
+/mem forget <id>     # 删除指定长期记忆（管理员可删任意，其他人只能删自己的）
+/mem models          # 列出 AstrBot 所有模型提供商
 /mem model <提供商id> # 设置 AI 整理使用的提供商
-/mem stat        # 查看记忆统计
-/mem help        # 显示帮助
+/mem stat            # 查看本 bot 当前会话记忆统计
+/mem stat all        # 按 bot 维度汇总各记忆库的长期/短期条数（别名 bot/bots）
+/mem help            # 显示帮助
 ```
 
 ## 工作原理
@@ -78,7 +83,9 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 
 ## 数据位置
 
-- 数据库：`<AstrBot根目录>/data/smart_memory/memory.db`
+- 数据库：`<AstrBot根目录>/data/smart_memory/memory_<self_id>.db`（每个 bot 实例一个库，多开互不干扰）
+  - 旧版单库 `memory.db` 会在首个 bot 触发时**自动原子迁移**（改名）为对应实例的库，仅迁移一次，旧数据不丢
+- 插件日志：`<AstrBot根目录>/data/smart_memory/plugin.log`
 - 插件配置：`<AstrBot根目录>/data/config/astrbot_plugin_stardust_diary_config.json`
 
 ## 常见问题
@@ -88,6 +95,12 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 
 - **问：满 100 条后原始消息会删吗？**
   - 答：会。AI 提炼完画像和要点存入长期记忆后，该批原始消息清空，避免重复整理。
+
+- **问：升级到 1.5.1 后我原来的记忆还在吗？**
+  - 答：在。旧 `memory.db` 会在首个 bot 触发时自动改名为 `memory_<self_id>.db` 并继续使用；若升级前没有备份，建议先备份 `data/smart_memory/` 目录再升级。
+
+- **问：一台 AstrBot 挂了多个 bot 账号，记忆会串吗？**
+  - 答：不会。1.5.1 起每个账号（self_id）独立一个数据库，群与群之间也按群隔离，完全互不可见。
 
 - **问：和 AstrBot 的上下文压缩冲突吗？**
   - 答：不冲突。压缩器处理的是旧对话历史，星尘手账只往 system_prompt 注入少量记忆片段。
