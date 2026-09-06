@@ -7,6 +7,7 @@ Smart Memory - AstrBot 智能记忆插件
 - 疑似重要的消息由 LLM 判断，重要则摘要进长期记忆
 - 群聊触发 LLM 请求时，检索本群相关长期记忆注入 system_prompt
 - 按群隔离：群与群之间的记忆互不可见
+- 按 bot 分库：每个 self_id 独立 memory_<self_id>.db，多开实例互不串记忆
 """
 import asyncio
 import json
@@ -32,6 +33,32 @@ except ImportError:  # 兼容旧版本 AstrBot
     def get_astrbot_data_path() -> str:
         return os.path.realpath(os.path.join(os.getcwd(), "data"))
 
+# ---- 检索优化辅助（繁简归一化 / 探询意图）----
+try:
+    from opencc import OpenCC
+
+    _T2S = OpenCC("t2s")
+except Exception:
+    _T2S = None
+
+
+def _norm(text: str) -> str:
+    """繁体转简体；opencc 不可用时原样返回。"""
+    if not text or _T2S is None:
+        return text or ""
+    try:
+        return _T2S.convert(text)
+    except Exception:
+        return text or ""
+
+
+# 提问疑似在确认"对方是否记得自己 / 双方关系"时的探询词
+_PROBE_RE = re.compile(
+    r"记得|记住|忘记|忘了|忘掉|记忆|还记得|記得|記住|忘記|記憶|認識|认识|"
+    r"想起|想我|我是谁|我是誰|我的事|知道我|了解我|喜欢|喜歡|讨厌|討厭|爱|愛|"
+    r"每天|平时|平時|经常|經常|总(?:是|会)|称呼|叫我|我的名字|叫(?:我|什么)"
+)
+
 
 # 命中这些词的消息才值得交给 LLM 判断（节省 token）
 class SmartMemory(Star):
@@ -41,56 +68,98 @@ class SmartMemory(Star):
         data_dir = get_astrbot_data_path()
         self.db_dir = os.path.join(data_dir, "smart_memory")
         os.makedirs(self.db_dir, exist_ok=True)
-        self.db_path = os.path.join(self.db_dir, "memory.db")
-        self._init_db()
-        self._cleanup_expired()
-        self._organizing: set = set()  # 正在整理的群，避免并发重复触发
+        self._legacy_db = os.path.join(self.db_dir, "memory.db")  # 旧版单库（升级后仅迁移一次）
+        self._ensured: set = set()       # 已初始化（建表）的 bot 库
+        self._organizing: set = set()    # 正在整理的群，避免并发重复触发
+        self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
 
-    # ---------------- 数据库 ----------------
-    def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
+    # ---------------- 数据库（按 bot self_id 分库） ----------------
+    def _db_path(self, self_id=None) -> str:
+        """每个 bot 独立库文件 memory_<self_id>.db，多开实例互不串记忆。"""
+        sid = re.sub(r"[^0-9A-Za-z_-]", "_", str(self_id or "unknown"))
+        return os.path.join(self.db_dir, f"memory_{sid}.db")
+
+    def _connect(self, db_path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_db(self):
-        with closing(self._conn()) as conn, conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS long_term (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    user_name TEXT DEFAULT '',
-                    content TEXT NOT NULL,
-                    keywords TEXT DEFAULT '',
-                    raw TEXT DEFAULT '',
-                    created_at REAL NOT NULL
-                )
-                """
+    @staticmethod
+    def _schema(conn) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS long_term (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                user_name TEXT DEFAULT '',
+                content TEXT NOT NULL,
+                keywords TEXT DEFAULT '',
+                raw TEXT DEFAULT '',
+                created_at REAL NOT NULL
             )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_long_group ON long_term(group_id)"
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_long_group ON long_term(group_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS short_term (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                user_name TEXT DEFAULT '',
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expire_at REAL NOT NULL
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS short_term (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    group_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    user_name TEXT DEFAULT '',
-                    content TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    expire_at REAL NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_short_group ON short_term(group_id)"
-            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_short_group ON short_term(group_id)")
 
-    def _cleanup_expired(self):
+    def _ensure_db(self, self_id=None) -> str:
+        """确保某 bot 的库已建表；旧版 memory.db 只迁移一次给首个 bot。"""
+        db_path = self._db_path(self_id)
+        if db_path in self._ensured:
+            return db_path
+        if not os.path.exists(db_path) and os.path.exists(self._legacy_db):
+            try:
+                # 旧版单库 → 首个触发的 bot 的库；改名后其它 bot 不会再重复复制
+                os.replace(self._legacy_db, db_path)
+                logger.info(
+                    f"[SmartMemory] 旧库已迁移: memory.db -> {os.path.basename(db_path)}"
+                )
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning(f"[SmartMemory] 旧库迁移失败: {e}")
         try:
-            with closing(self._conn()) as conn, conn:
+            with closing(self._connect(db_path)) as conn, conn:
+                self._schema(conn)
+        except Exception as e:
+            logger.warning(f"[SmartMemory] 初始化数据库失败 {db_path}: {e}")
+        self._cleanup_expired(db_path)
+        self._ensured.add(db_path)
+        return db_path
+
+    def _init_all_db(self):
+        """启动时为所有已存在的 memory_*.db 建表并清理过期。"""
+        try:
+            for name in os.listdir(self.db_dir):
+                if re.fullmatch(r"memory_[0-9A-Za-z_-]+\.db", name):
+                    p = os.path.join(self.db_dir, name)
+                    try:
+                        with closing(self._connect(p)) as conn, conn:
+                            self._schema(conn)
+                        self._cleanup_expired(p)
+                        self._ensured.add(p)
+                    except Exception as e:
+                        logger.warning(f"[SmartMemory] 初始化库 {name} 失败: {e}")
+        except Exception as e:
+            logger.warning(f"[SmartMemory] 扫描数据库目录失败: {e}")
+
+    def _cleanup_expired(self, db_path: str):
+        try:
+            with closing(self._connect(db_path)) as conn, conn:
                 conn.execute(
                     "DELETE FROM short_term WHERE expire_at < ?", (time.time(),)
                 )
@@ -105,6 +174,7 @@ class SmartMemory(Star):
         # 忽略 bot 自己的消息，避免自我循环
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
+        self_id = str(event.get_self_id())
         text = event.get_message_str().strip()
         if not text:
             return
@@ -115,17 +185,18 @@ class SmartMemory(Star):
         user_id = str(event.get_sender_id())
         user_name = event.get_sender_name() or user_id
 
-        # 1. 消息进短期缓冲
-        self._add_short(group_id, user_id, user_name, text)
+        # 1. 消息进短期缓冲（按 bot 分库）
+        self._ensure_db(self_id)
+        self._add_short(self_id, group_id, user_id, user_name, text)
 
         # 2. 满阈值触发 AI 整理（异步，不阻塞回复）
         if self.config.get("organize_enabled", True):
-            n = self._count_short(group_id)
+            n = self._count_short(self_id, group_id)
             if n >= int(self.config.get("organize_threshold", 100)):
-                asyncio.create_task(self._organize(group_id))
+                asyncio.create_task(self._organize(self_id, group_id))
 
     # ---------------- 满阈值 AI 整理 ----------------
-    async def _organize(self, group_id: str):
+    async def _organize(self, self_id: str, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
         if group_id in self._organizing:
             self._log(f"[星尘手账] 群 {group_id} 正在整理中，跳过本次触发")
@@ -133,7 +204,7 @@ class SmartMemory(Star):
         self._organizing.add(group_id)
         try:
             self._log(f"[星尘手账] _organize 被调用，群 {group_id}")
-            msgs = self._all_short(group_id)
+            msgs = self._all_short(self_id, group_id)
             self._log(f"[星尘手账] 群 {group_id} 缓冲 {len(msgs)} 条")
             if len(msgs) < int(self.config.get("organize_threshold", 100)):
                 return
@@ -175,7 +246,7 @@ class SmartMemory(Star):
                     continue
                 kv = "；".join(f"{k}={v}" for k, v in attrs.items())
                 self._add_long(
-                    group_id, "system", uname, f"【画像】{uname}：{kv}",
+                    self_id, group_id, "system", uname, f"【画像】{uname}：{kv}",
                     [uname] + list(attrs.keys()), "人物画像",
                 )
                 saved += 1
@@ -185,12 +256,12 @@ class SmartMemory(Star):
                 if not content:
                     continue
                 self._add_long(
-                    group_id, "system", "星尘手账", content[:200],
+                    self_id, group_id, "system", "星尘手账", content[:200],
                     m.get("keywords") or [], "要点提取",
                 )
                 saved += 1
             # 清空缓冲，重新计数
-            self._clear_short(group_id)
+            self._clear_short(self_id, group_id)
             self._log(f"[星尘手账] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
             self._log(f"[星尘手账] AI 整理失败: {e}")
@@ -252,9 +323,9 @@ class SmartMemory(Star):
         except Exception as e:
             logger.warning(f"[星尘手账] 保存插件配置失败: {e}")
 
-    def _count_short(self, group_id: str) -> int:
+    def _count_short(self, self_id: str, group_id: str) -> int:
         try:
-            with closing(self._conn()) as conn:
+            with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
                     "SELECT COUNT(*) FROM short_term WHERE group_id = ?",
                     (group_id,),
@@ -262,9 +333,9 @@ class SmartMemory(Star):
         except Exception:
             return 0
 
-    def _all_short(self, group_id: str, limit: int = 500):
+    def _all_short(self, self_id: str, group_id: str, limit: int = 500):
         try:
-            with closing(self._conn()) as conn:
+            with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
                     "SELECT * FROM short_term WHERE group_id = ? "
                     "ORDER BY created_at ASC LIMIT ?",
@@ -273,9 +344,9 @@ class SmartMemory(Star):
         except Exception:
             return []
 
-    def _clear_short(self, group_id: str):
+    def _clear_short(self, self_id: str, group_id: str):
         try:
-            with closing(self._conn()) as conn, conn:
+            with closing(self._connect(self._db_path(self_id))) as conn, conn:
                 conn.execute(
                     "DELETE FROM short_term WHERE group_id = ?", (group_id,)
                 )
@@ -283,10 +354,10 @@ class SmartMemory(Star):
             logger.warning(f"[星尘手账] 清空缓冲失败: {e}")
 
     # ---------------- 存储 ----------------
-    def _add_short(self, group_id, user_id, user_name, text):
+    def _add_short(self, self_id, group_id, user_id, user_name, text):
         now = time.time()
         try:
-            with closing(self._conn()) as conn, conn:
+            with closing(self._connect(self._db_path(self_id))) as conn, conn:
                 conn.execute(
                     "INSERT INTO short_term (group_id, user_id, user_name, content, created_at, expire_at) "
                     "VALUES (?,?,?,?,?,?)",
@@ -295,9 +366,9 @@ class SmartMemory(Star):
         except Exception as e:
             logger.warning(f"[SmartMemory] 短期记忆写入失败: {e}")
 
-    def _add_long(self, group_id, user_id, user_name, summary, keywords, raw):
+    def _add_long(self, self_id, group_id, user_id, user_name, summary, keywords, raw):
         try:
-            with closing(self._conn()) as conn, conn:
+            with closing(self._connect(self._db_path(self_id))) as conn, conn:
                 conn.execute(
                     "INSERT INTO long_term (group_id, user_id, user_name, content, keywords, raw, created_at) "
                     "VALUES (?,?,?,?,?,?,?)",
@@ -315,12 +386,13 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 长期记忆写入失败: {e}")
 
     # ---------------- 检索 ----------------
-    def _search_long(self, group_id: str, query: str, top_k: int = 5):
+    def _search_long(self, self_id: str, group_id: str, query: str, top_k: int = 5):
         query = (query or "").strip()
+        q_norm = _norm(query)
         try:
-            with closing(self._conn()) as conn:
+            with closing(self._connect(self._db_path(self_id))) as conn:
                 rows = conn.execute(
-                    "SELECT * FROM long_term WHERE group_id = ? ORDER BY created_at DESC LIMIT 300",
+                    "SELECT * FROM long_term WHERE group_id = ? ORDER BY created_at DESC LIMIT 600",
                     (group_id,),
                 ).fetchall()
         except Exception as e:
@@ -329,14 +401,19 @@ class SmartMemory(Star):
         scored = []
         for r in rows:
             score = 0
-            for kw in (r["keywords"] or "").split(","):
-                if kw and kw in query:
-                    score += 2
             content = r["content"] or ""
-            if query and query in content:
+            c_norm = _norm(content)
+            # 关键词：原文与简体化后各命中一次（原/简混合也能对上）
+            for kw in (r["keywords"] or "").split(","):
+                if kw and (kw in query or _norm(kw) in q_norm):
+                    score += 2
+            # 正文包含提问原文 / 提问的简体形式
+            if query and (query in content or q_norm in c_norm):
                 score += 3
-            for gram in self._grams(query):
-                if gram and gram in content:
+            # 4-gram 重叠（原文 + 简体化各算一遍）
+            grams = self._grams(query) | self._grams(q_norm)
+            for gram in grams:
+                if gram and (gram in content or gram in c_norm):
                     score += 1
             if score > 0:
                 scored.append((score, r))
@@ -347,6 +424,40 @@ class SmartMemory(Star):
     def _grams(s: str, n: int = 4):
         s = re.sub(r"\s+", "", s or "")
         return {s[i:i + n] for i in range(max(0, len(s) - n + 1))}
+
+    def _member_rows(self, self_id: str, group_id: str, user_id, user_name, limit: int = 4):
+        """按 QQ号/昵称 检索某成员本人的画像与长期记忆（兜底注入用）。
+
+        画像行 user_id 通常是 system，真实身份写在 content（QQ号=xxx）里，
+        因此优先用 content 内的 QQ 号匹配，其次用昵称。
+        """
+        uid = str(user_id or "")
+        name = (user_name or "").strip()
+        conds, args = [], [group_id]
+        if uid:
+            conds.append("content LIKE ?")
+            args.append(f"%QQ号={uid}%")
+            conds.append("content LIKE ?")
+            args.append(f"%({uid})%")
+            conds.append("user_id = ?")
+            args.append(uid)
+        if name:
+            conds.append("user_name LIKE ?")
+            args.append(f"%{name}%")
+        if not conds:
+            return []
+        args.append(limit)
+        sql = (
+            "SELECT * FROM long_term WHERE group_id = ? AND ("
+            + " OR ".join(conds)
+            + ") ORDER BY (content LIKE '%画像%') DESC, created_at DESC LIMIT ?"
+        )
+        try:
+            with closing(self._connect(self._db_path(self_id))) as conn:
+                return conn.execute(sql, tuple(args)).fetchall()
+        except Exception as e:
+            logger.warning(f"[SmartMemory] 成员档案检索失败: {e}")
+            return []
 
     def _since_ts(self, level: str) -> float:
         """分层时间起点：L1长期全部 / L2今天 / L3最近三天 / L4本周一。"""
@@ -372,9 +483,9 @@ class SmartMemory(Star):
             return "L4"
         return None
 
-    def _recent_short_since(self, group_id: str, since_ts: float, n: int = 10):
+    def _recent_short_since(self, self_id: str, group_id: str, since_ts: float, n: int = 10):
         try:
-            with closing(self._conn()) as conn:
+            with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
                     "SELECT * FROM short_term WHERE group_id = ? AND created_at >= ? "
                     "ORDER BY created_at DESC LIMIT ?",
@@ -383,9 +494,9 @@ class SmartMemory(Star):
         except Exception:
             return []
 
-    def _recent_short(self, group_id: str, n: int = 10):
+    def _recent_short(self, self_id: str, group_id: str, n: int = 10):
         try:
-            with closing(self._conn()) as conn:
+            with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
                     "SELECT * FROM short_term WHERE group_id = ? AND expire_at > ? "
                     "ORDER BY created_at DESC LIMIT ?",
@@ -401,25 +512,46 @@ class SmartMemory(Star):
             if event.get_message_type() not in (MessageType.GROUP_MESSAGE, MessageType.FRIEND_MESSAGE):
                 return
             group_id = self._get_scope(event)
+            self_id = str(event.get_self_id())
             query = event.get_message_str().strip()
             if not query:
                 return
+            self._ensure_db(self_id)
             parts = []
             # 相关长期记忆
             top_k = int(self.config.get("top_k", 5))
-            mems = self._search_long(group_id, query, top_k)
+            mems = self._search_long(self_id, group_id, query, top_k)
             if mems:
                 lines = []
                 for r in mems:
                     when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
                     lines.append(f"- ({when} {r['user_name']}) {r['content']}")
                 parts.append("【记忆片段，来自本群历史消息，可参考但勿编造】\n" + "\n".join(lines))
+            # 提问者本人档案/记忆兜底：问“你记得我吗/我平时怎样”时本人画像优先
+            uid = str(event.get_sender_id() or "")
+            uname = event.get_sender_name() or uid
+            if uid and (not mems or _PROBE_RE.search(query)):
+                try:
+                    own = self._member_rows(self_id, group_id, uid, uname, 4)
+                    if own:
+                        dup = {m["id"] for m in (mems or [])}
+                        own_lines = []
+                        for r in own:
+                            if r["id"] in dup:
+                                continue
+                            when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
+                            own_lines.append(f"- ({when} {r['user_name']}) {r['content']}")
+                        if own_lines:
+                            parts.append("【提问者本人档案/记忆，涉及ta自己或你俩关系时以此为准】\n"
+                                        + "\n".join(own_lines[:3]))
+                except Exception:
+                    pass
             # 分层短期记忆：识别提问的时间意图（L2今天/L3最近几天/L4本周）
             level = self._detect_time_intent(query)
             if level:
                 since = self._since_ts(level)
                 n = int(self.config.get("recent_count", 5)) * 2
-                rows = self._recent_short_since(group_id, since, n)
+                rows = self._recent_short_since(self_id, group_id, since, n)
                 label = {"L2": "今天", "L3": "最近几天", "L4": "本周"}.get(level, level)
                 if rows:
                     lines = [
@@ -434,7 +566,7 @@ class SmartMemory(Star):
                 )
             elif self.config.get("include_recent", True):
                 n = int(self.config.get("recent_count", 5))
-                recent = self._recent_short(group_id, n)
+                recent = self._recent_short(self_id, group_id, n)
                 if recent:
                     lines = [
                         f"- {r['user_name']}: {r['content']}" for r in reversed(recent)
@@ -454,12 +586,14 @@ class SmartMemory(Star):
         args = (event.message_str or "").split()
         sub = args[1].strip().lower() if len(args) > 1 else "help"
         group_id = self._get_scope(event)
+        self_id = str(event.get_self_id())
         user_id = str(event.get_sender_id())
+        self._ensure_db(self_id)
 
         if sub == "list":
             n = int(args[2]) if len(args) > 2 and args[2].isdigit() else 10
             try:
-                with closing(self._conn()) as conn:
+                with closing(self._connect(self._db_path(self_id))) as conn:
                     rows = conn.execute(
                         "SELECT * FROM long_term WHERE group_id = ? "
                         "ORDER BY created_at DESC LIMIT ?",
@@ -480,7 +614,7 @@ class SmartMemory(Star):
 
         if sub == "recent":
             n = int(args[2]) if len(args) > 2 and args[2].isdigit() else 10
-            recent = self._recent_short(group_id, n)
+            recent = self._recent_short(self_id, group_id, n)
             if not recent:
                 yield event.plain_result("本群最近没有短期消息记录～")
                 return
@@ -497,7 +631,7 @@ class SmartMemory(Star):
                 return
             mid = int(args[2])
             try:
-                with closing(self._conn()) as conn:
+                with closing(self._connect(self._db_path(self_id))) as conn, conn:
                     row = conn.execute(
                         "SELECT * FROM long_term WHERE id = ? AND group_id = ?",
                         (mid, group_id),
@@ -546,7 +680,30 @@ class SmartMemory(Star):
 
         if sub == "stat":
             try:
-                with closing(self._conn()) as conn:
+                # /mem stat all：多 bot 维度汇总每个库的长期/短期总数
+                if len(args) > 2 and args[2].lower() in ("all", "bot", "bots"):
+                    names = sorted(
+                        n for n in os.listdir(self.db_dir)
+                        if re.fullmatch(r"memory_[0-9A-Za-z_-]+\.db", n)
+                    )
+                    if not names:
+                        yield event.plain_result("还没有任何 bot 的记忆库哦～")
+                        return
+                    lines = ["各 bot 记忆库统计："]
+                    for n in names:
+                        with closing(self._connect(os.path.join(self.db_dir, n))) as conn:
+                            long_n = conn.execute(
+                                "SELECT COUNT(*) FROM long_term"
+                            ).fetchone()[0]
+                            short_n = conn.execute(
+                                "SELECT COUNT(*) FROM short_term WHERE expire_at > ?",
+                                (time.time(),),
+                            ).fetchone()[0]
+                        bot = n[len("memory_"):-len(".db")]
+                        lines.append(f"bot {bot}: 长期 {long_n} 条，短期（一天内）{short_n} 条")
+                    yield event.plain_result("\n".join(lines))
+                    return
+                with closing(self._connect(self._db_path(self_id))) as conn:
                     long_n = conn.execute(
                         "SELECT COUNT(*) FROM long_term WHERE group_id = ?", (group_id,)
                     ).fetchone()[0]
