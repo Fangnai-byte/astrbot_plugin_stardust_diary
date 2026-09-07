@@ -199,20 +199,20 @@ class SmartMemory(Star):
     async def _organize(self, self_id: str, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
         if group_id in self._organizing:
-            self._log(f"[星尘手账] 群 {group_id} 正在整理中，跳过本次触发")
+            self._log(f"[绫地宁宁] 群 {group_id} 正在整理中，跳过本次触发")
             return
         self._organizing.add(group_id)
         try:
-            self._log(f"[星尘手账] _organize 被调用，群 {group_id}")
+            self._log(f"[绫地宁宁] _organize 被调用，群 {group_id}")
             msgs = self._all_short(self_id, group_id)
-            self._log(f"[星尘手账] 群 {group_id} 缓冲 {len(msgs)} 条")
+            self._log(f"[绫地宁宁] 群 {group_id} 缓冲 {len(msgs)} 条")
             if len(msgs) < int(self.config.get("organize_threshold", 100)):
                 return
             text = "\n".join(
                 f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
             )[:12000]
             provider = self._pick_provider()
-            self._log(f"[星尘手账] provider: {provider.meta().id if provider else None}")
+            self._log(f"[绫地宁宁] provider: {provider.meta().id if provider else None}")
             if provider is None:
                 return
             resp = await provider.text_chat(
@@ -232,9 +232,9 @@ class SmartMemory(Star):
             out = "".join(
                 [c.text for c in (resp.result_chain.chain if resp.result_chain else []) if isinstance(c, Plain)]
             )
-            self._log(f"[星尘手账] LLM 返回前100字: {out[:100]!r}")
+            self._log(f"[绫地宁宁] LLM 返回前100字: {out[:100]!r}")
             data = self._parse_json(out)
-            self._log(f"[星尘手账] 解析结果: {bool(data)}")
+            self._log(f"[绫地宁宁] 解析结果: {bool(data)}")
             if not data:
                 return
             saved = 0
@@ -256,15 +256,15 @@ class SmartMemory(Star):
                 if not content:
                     continue
                 self._add_long(
-                    self_id, group_id, "system", "星尘手账", content[:200],
+                    self_id, group_id, "system", "绫地宁宁", content[:200],
                     m.get("keywords") or [], "要点提取",
                 )
                 saved += 1
             # 清空缓冲，重新计数
             self._clear_short(self_id, group_id)
-            self._log(f"[星尘手账] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
+            self._log(f"[绫地宁宁] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
-            self._log(f"[星尘手账] AI 整理失败: {e}")
+            self._log(f"[绫地宁宁] AI 整理失败: {e}")
         finally:
             self._organizing.discard(group_id)
 
@@ -305,10 +305,10 @@ class SmartMemory(Star):
                 p = self.context.get_provider_by_id(pid)
                 if p is not None:
                     return p
-                logger.warning(f"[星尘手账] 供应商 {pid} 不存在，改用当前模型")
+                logger.warning(f"[绫地宁宁] 供应商 {pid} 不存在，改用当前模型")
             return self.context.get_using_provider()
         except Exception as e:
-            logger.warning(f"[星尘手账] 选择供应商失败: {e}")
+            logger.warning(f"[绫地宁宁] 选择供应商失败: {e}")
             return None
 
     def _save_plugin_config(self) -> None:
@@ -321,7 +321,7 @@ class SmartMemory(Star):
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.warning(f"[星尘手账] 保存插件配置失败: {e}")
+            logger.warning(f"[绫地宁宁] 保存插件配置失败: {e}")
 
     def _count_short(self, self_id: str, group_id: str) -> int:
         try:
@@ -351,7 +351,7 @@ class SmartMemory(Star):
                     "DELETE FROM short_term WHERE group_id = ?", (group_id,)
                 )
         except Exception as e:
-            logger.warning(f"[星尘手账] 清空缓冲失败: {e}")
+            logger.warning(f"[绫地宁宁] 清空缓冲失败: {e}")
 
     # ---------------- 存储 ----------------
     def _add_short(self, self_id, group_id, user_id, user_name, text):
