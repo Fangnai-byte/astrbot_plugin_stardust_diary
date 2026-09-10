@@ -43,18 +43,25 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 
 ## 使用
 
-发送指令（群聊；`/mem` 相关指令在私聊也可用，记忆存于对应私聊会话）：
+发送指令（群聊；`/mem` 相关指令在私聊也可用，记忆存于对应私聊会话）。
+
+**注意：以下指令全部仅限管理员使用**（非管理员触发时回复无权提示）：
 
 ```
 /mem list [n]        # 查看本会话最近 n 条长期记忆（默认 10）
 /mem recent [n]      # 查看缓冲中的最近 n 条消息（默认 10）
-/mem forget <id>     # 删除指定长期记忆（管理员可删任意，其他人只能删自己的）
+/mem forget <id>     # 删除指定长期记忆（只能删本会话的）
 /mem models          # 列出 AstrBot 所有模型提供商
 /mem model <提供商id> # 设置 AI 整理使用的提供商
 /mem stat            # 查看本 bot 当前会话记忆统计
 /mem stat all        # 按 bot 维度汇总各记忆库的长期/短期条数（别名 bot/bots）
 /mem help            # 显示帮助
 ```
+
+权限说明：
+- 权限由插件内的管理员过滤器声明，也可在 WebUI「指令管理」中查看/调整
+- 管理员 ID 在 AstrBot 全局配置的 `admins_id` 中维护
+- 若被拒时没有任何回复，请在全局配置中开启「无权限时回复提示」（`no_permission_reply`）
 
 ## 工作原理
 
