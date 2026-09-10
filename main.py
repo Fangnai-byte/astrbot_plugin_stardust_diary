@@ -361,7 +361,8 @@ class SmartMemory(Star):
                 conn.execute(
                     "INSERT INTO short_term (group_id, user_id, user_name, content, created_at, expire_at) "
                     "VALUES (?,?,?,?,?,?)",
-                    (group_id, user_id, user_name, text[:500], now, now + 86400),
+                    (group_id, user_id, user_name, text[:500], now,
+                     now + max(1, int(self.config.get("short_retain_days", 3))) * 86400),
                 )
         except Exception as e:
             logger.warning(f"[SmartMemory] 短期记忆写入失败: {e}")
@@ -399,6 +400,8 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 检索失败: {e}")
             return []
         scored = []
+        time_level = self._detect_time_intent(query)
+        time_since = self._since_ts(time_level) if time_level else 0.0
         for r in rows:
             score = 0
             content = r["content"] or ""
@@ -415,6 +418,9 @@ class SmartMemory(Star):
             for gram in grams:
                 if gram and (gram in content or gram in c_norm):
                     score += 1
+            # 时间意图命中：问“昨天/最近”这类时间词时，时间段内的记忆优先
+            if time_since and score == 0 and (r["created_at"] or 0) >= time_since:
+                score += 2
             if score > 0:
                 scored.append((score, r))
         scored.sort(key=lambda x: -x[0])
@@ -475,13 +481,22 @@ class SmartMemory(Star):
 
     def _detect_time_intent(self, query: str) -> str | None:
         """根据提问内容判断时间层级意图。"""
-        if any(k in query for k in ("今天", "刚才", "今早", "今晚", "早上", "下午", "中午", "晚上")):
+        if any(k in query for k in ("今天", "刚刚", "刚才", "此刻", "现在", "今早", "今晨",
+                                    "今晚", "今夜", "今儿", "早上", "上午", "下午", "中午", "晚上")):
             return "L2"
-        if any(k in query for k in ("最近", "这两天", "这几天", "前两天", "前天", "昨天")):
+        if any(k in query for k in ("最近", "这两天", "这几天", "前两天", "前天", "大前天",
+                                    "昨天", "昨晚", "昨日", "昨夜")):
             return "L3"
-        if any(k in query for k in ("本周", "这周", "这星期", "这个星期", "星期", "一周")):
+        if any(k in query for k in ("本周", "这周", "这星期", "这个星期", "星期", "一周", "上周")):
             return "L4"
         return None
+
+    @staticmethod
+    def _now_str() -> str:
+        """当前时间锚点，供模型换算“今天/昨天/最近”。"""
+        now = datetime.now()
+        week = "一二三四五六日"[now.weekday()]
+        return now.strftime("%Y-%m-%d %H:%M") + f" 周{week}"
 
     def _recent_short_since(self, self_id: str, group_id: str, since_ts: float, n: int = 10):
         try:
@@ -552,12 +567,18 @@ class SmartMemory(Star):
                 since = self._since_ts(level)
                 n = int(self.config.get("recent_count", 5)) * 2
                 rows = self._recent_short_since(self_id, group_id, since, n)
-                label = {"L2": "今天", "L3": "最近几天", "L4": "本周"}.get(level, level)
+                label = {"L2": "今天", "L3": "最近三天", "L4": "本周"}.get(level, level)
                 if rows:
                     lines = [
-                        f"- {r['user_name']}: {r['content']}" for r in reversed(rows)
+                        f"- {datetime.fromtimestamp(r['created_at']).strftime('%m-%d %H:%M')} "
+                        f"{r['user_name']}: {r['content']}"
+                        for r in reversed(rows)
                     ]
-                    parts.append(f"【{label}的群聊记录，用户可能问的是这段时间的事】\n" + "\n".join(lines))
+                    parts.append(
+                        f"【{label}的消息记录，用户可能问的是这段时间的事】\n"
+                        f"【当前时间】{self._now_str()}，请据此换算今天/昨天/最近\n"
+                        + "\n".join(lines)
+                    )
                 # 关键词追问引导
                 parts.append(
                     "【检索提示】若用户询问时间段内发生的事情但描述模糊，"
@@ -623,7 +644,7 @@ class SmartMemory(Star):
             if not recent:
                 yield event.plain_result("本群最近没有短期消息记录～")
                 return
-            lines = [f"本群最近 {len(recent)} 条消息（一天内有效）："]
+            lines = [f"本群最近 {len(recent)} 条消息（保留期内有效）："]
             for r in reversed(recent):
                 when = datetime.fromtimestamp(r["created_at"]).strftime("%H:%M")
                 lines.append(f"({when} {r['user_name']}) {r['content']}")
@@ -705,7 +726,7 @@ class SmartMemory(Star):
                                 (time.time(),),
                             ).fetchone()[0]
                         bot = n[len("memory_"):-len(".db")]
-                        lines.append(f"bot {bot}: 长期 {long_n} 条，短期（一天内）{short_n} 条")
+                        lines.append(f"bot {bot}: 长期 {long_n} 条，短期（保留期内）{short_n} 条")
                     yield event.plain_result("\n".join(lines))
                     return
                 with closing(self._connect(self._db_path(self_id))) as conn:
@@ -717,7 +738,7 @@ class SmartMemory(Star):
                         (group_id, time.time()),
                     ).fetchone()[0]
                 yield event.plain_result(
-                    f"本群记忆统计：长期 {long_n} 条，短期（一天内）{short_n} 条"
+                    f"本群记忆统计：长期 {long_n} 条，短期（保留期内）{short_n} 条"
                 )
             except Exception as e:
                 yield event.plain_result(f"统计失败: {e}")

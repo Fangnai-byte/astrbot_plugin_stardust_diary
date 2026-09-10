@@ -41,5 +41,11 @@
     "hint": "include_recent 开启时生效",
     "type": "int",
     "default": 5
+  },
+  "short_retain_days": {
+    "description": "短期记忆保留天数",
+    "hint": "缓冲消息保留多久，默认3天（“昨天/最近”类提问可查）",
+    "type": "int",
+    "default": 3
   }
 }
