@@ -581,8 +581,13 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 注入记忆失败: {e}")
 
     # ---------------- 指令 ----------------
+    @filter.permission_type(PermissionType.ADMIN)
     @filter.command("mem", alias={"memory"})
     async def mem(self, event: AstrMessageEvent):
+        # 全部子指令（list/recent/forget/models/model/stat/stat all/help）仅管理员可用
+        if not event.is_admin():
+            yield event.plain_result("这条指令只有管理员能用哦～")
+            return
         args = (event.message_str or "").split()
         sub = args[1].strip().lower() if len(args) > 1 else "help"
         group_id = self._get_scope(event)
