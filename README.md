@@ -27,7 +27,7 @@
 或从 Git 仓库安装：
 
 ```
-https://github.com/NekoHome-Studio/astrbot_plugin_stardust_diary
+https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 ```
 
 ## 配置
