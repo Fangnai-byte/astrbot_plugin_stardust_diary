@@ -30,11 +30,29 @@
     "type": "int",
     "default": 5
   },
+  "min_score": {
+    "description": "记忆召回的最低相关分",
+    "hint": "低于此分不注入。调高更干净、调低更啰嗦；默认 2 可挡掉「唔....」这类语气词擦边命中",
+    "type": "int",
+    "default": 2
+  },
+  "max_profile_memories": {
+    "description": "召回里最多允许几条画像",
+    "hint": "画像很长、时效性弱。默认 1，避免几段旧档案挤掉普通要点记忆",
+    "type": "int",
+    "default": 1
+  },
   "include_recent": {
     "description": "是否注入缓冲中的最近消息",
     "hint": "开启后会在上下文附带缓冲中最近几条消息，帮助理解当前语境",
     "type": "bool",
     "default": true
+  },
+  "inject_recent_list": {
+    "description": "是否注入【最近消息】清单（会重复会话历史）",
+    "hint": "关掉更干净：这段内容和会话自身的历史重复，且只列对方发言。默认关",
+    "type": "bool",
+    "default": false
   },
   "recent_count": {
     "description": "注入的最近消息条数",
@@ -42,10 +60,40 @@
     "type": "int",
     "default": 5
   },
+  "profile_fallback": {
+    "description": "检索不到相关记忆时，兜底注入本人画像",
+    "hint": "开着会让每轮都带上画像（体积大、易带偏当轮语境）。关掉后只在明确问「你记得我吗」类探询时才注入",
+    "type": "bool",
+    "default": true
+  },
+  "profile_limit": {
+    "description": "本人画像兜底注入条数",
+    "hint": "建议 1 条；调大容易让当轮对话被旧记忆淹没",
+    "type": "int",
+    "default": 1
+  },
+  "profile_max_chars": {
+    "description": "每条画像注入的最大字符数",
+    "hint": "超出会截断。画像原文常有数百字，截到 120 字左右可显著降低干扰",
+    "type": "int",
+    "default": 120
+  },
+  "profile_dynamic_ttl_days": {
+    "description": "动态条目的注入保质期（天）",
+    "hint": "近期情绪/近期感受/事件/预算这类会过期的键，超过这么多天就不再注入（只在注入时过滤，不删库）。填 0 关闭时效过滤",
+    "type": "int",
+    "default": 3
+  },
   "short_retain_days": {
     "description": "短期记忆保留天数",
     "hint": "缓冲消息保留多久，默认3天（“昨天/最近”类提问可查）",
     "type": "int",
     "default": 3
+  },
+  "auto_merge_profiles": {
+    "description": "自动合并同一人的多行画像",
+    "hint": "历史遗留的「旧档」快照会和正名档案各占一行、每轮一起注入。开启后按键值自动并成一行（新值覆盖旧值，旧行独有的键保留）。默认开",
+    "type": "bool",
+    "default": true
   }
 }

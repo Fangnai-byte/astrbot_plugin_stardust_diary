@@ -60,6 +60,189 @@ _PROBE_RE = re.compile(
 )
 
 
+def _clip(text: str, limit: int) -> str:
+    """按字符数截断文本，超出时加省略号（用于限制注入体积）。"""
+    s = (text or "").strip().replace("\n", " ")
+    if limit <= 0 or len(s) <= limit:
+        return s
+    return s[:limit] + "…"
+
+
+def _is_profile(content: str, user_name: str = "") -> bool:
+    """是否画像行。只认正文开头的【画像】标记，避免要点记忆里提到「画像」被误判。"""
+    return (content or "").lstrip().startswith("【画像】") or "旧档" in (user_name or "")
+
+
+def _profile_identity(content: str, user_name: str) -> str:
+    """画像行归一化身份：优先取正文『【画像】X：』里的 X，否则退回 user_name。"""
+    c = (content or "").lstrip()
+    if c.startswith("【画像】"):
+        rest = c[len("【画像】"):]
+        for sep in ("：", ":"):
+            if sep in rest:
+                name = rest.split(sep, 1)[0].strip()
+                if name:
+                    return SmartMemory._profile_key(name)
+    return SmartMemory._profile_key(user_name)
+
+
+def _is_temp_recall(content: str, user_name: str = "") -> bool:
+    """时效性内容（有人设保质期的「旧档」画像）不参与普通关键词召回。"""
+    return "旧档" in (user_name or "")
+
+
+def _sorted_pairs(d):
+    """稳定排序（键升序），让合并结果在多次迁移间可复现。"""
+    return sorted(d.items(), key=lambda kv: kv[0])
+
+
+# 同义键归一化：历史画像里同一件事被写成很多近义键，合并后会各留一份导致重复。
+# 收录两类规则：
+#   1) 纯同义 → 直接归并（如 昵称/称呼对象 → 称呼），不会丢信息；
+#   2) 语义有重叠但不完全等价 → 改名为独立键（如 身份/关注 → 关注领域），
+#      既让同一件事不再各占一份，又不丢旧表述。
+_PROFILE_KEY_ALIASES = {
+    "qq/id": "QQ", "qq号": "QQ", "用户id": "QQ", "id": "QQ", "另一个号": "QQ",
+    "昵称": "称呼", "称呼对象": "称呼", "称呼对方": "称呼", "被称呼": "称呼",
+    "身份/自称": "身份", "身份线索": "身份补充",
+    "身份/关注": "关注领域", "身份/活动": "活动",
+    "口头禅/用语": "口头禅", "常用语气": "口头禅", "常用语": "口头禅",
+    "常用工具": "工具",
+    "常用路径": "路径",
+    "常用命令": "命令",
+    "github仓库": "重要仓库", "相关仓库": "重要仓库", "github相关": "重要仓库",
+    "喜欢/偏好": "喜欢", "喜欢/在意": "喜欢",
+    "与宁宁关系": "关系", "与fangnai关系": "关系",
+    "被评价": "评价",
+}
+
+
+def _canon_key(key: str) -> str:
+    """把同义画像键收敛到统一写法。"""
+    k = (key or "").strip()
+    if not k:
+        return k
+    return _PROFILE_KEY_ALIASES.get(k.lower(), k)
+
+
+# 纯语气词 / 寒暄：这类消息本身不含信息，拿它去检索长期记忆只会捞出无关旧事
+_QUERY_FILLER_CHARS = set("好~～唔嗯啊哦噢诶欸嘿哈呀吧呢吗嘛的了么哼嘻噗呜哇额呃哈姆喵惹哦哦呀哎呀")
+_QUERY_FILLER_WORDS = {
+    "在吗", "在么", "在不在", "在嘛", "你好", "早上好", "午好", "中午好", "晚上好",
+    "晚安", "安", "安~", "早", "早呀", "嗨", "hi", "hello", "ok", "okk", "好的",
+    "好的呢", "好哦", "嘿嘿", "哈哈", "嗯嗯", "谢谢", "谢啦", "收到", "okay",
+}
+
+
+def _is_weak_query(query: str) -> bool:
+    """判断一条消息是否"纯语气/寒暄"——不含可检索的实质内容。"""
+    q = (query or "").strip()
+    if not q:
+        return True
+    compact = re.sub(r"[\s，。、！？!?.,~～…·\-—_]+", "", q).lower()
+    if not compact:
+        return True
+    if compact in _QUERY_FILLER_WORDS:
+        return True
+    # 短且字符几乎全是语气词/口头禅（如「好~」「唔....」「欸嘿~」）
+    if len(compact) <= 2 and all(ch in _QUERY_FILLER_CHARS for ch in compact):
+        return True
+    if len(compact) <= 4 and sum(ch in _QUERY_FILLER_CHARS for ch in compact) >= len(compact) - 1:
+        return True
+    # 语气词打头 + 很短（如「唔...所以」「唔....」）：仍属寒暄，不含可检索内容
+    filler_n = sum(ch in _QUERY_FILLER_CHARS for ch in compact)
+    if compact[0] in _QUERY_FILLER_CHARS and len(compact) <= 5:
+        return True
+    if len(compact) <= 8 and filler_n / len(compact) >= 0.5:
+        return True
+    return False
+
+
+# 画像键优先级：数字越大越优先保留。默认 50，没登记的键按 50 处理。
+# 目的：注入有字数上限时，别按字母序瞎丢——把"他是谁/你俩什么关系"留下，
+# 把项目版本号、预算这类低价值键挤出去。
+PROFILE_KEY_PRIORITY = {
+    # 90：核心身份与关系，永远优先
+    90: ("身份", "身份补充", "关系", "称呼", "擅长", "语言", "身体", "昵称"),
+    # 70：稳定偏好与互动方式
+    70: ("喜欢", "互动", "互动方式", "习惯", "习惯动作", "口头禅", "饮食", "在意",
+         "关心", "近期情绪", "近期感受", "近期个人事件", "重要态度", "遗憾", "事件",
+         "共同记忆", "互动事件", "亲密互动方式", "问候习惯", "日常", "特征",
+         "生理反应", "手", "家", "技能", "早餐", "评价", "行为线索", "被提醒",
+         "备注", "宁宁反应"),
+    # 50：默认档（未登记键）
+    # 20：低价值元信息，最容易先丢
+    20: ("项目", "项目版本", "预算", "挑战时长", "许可证决策", "许可偏好", "需求重点",
+         "设备", "设备注意", "设备限制", "相关图片", "关注领域", "活动",
+         "重要仓库", "路径", "命令", "工具", "语言习惯", "来源", "别名", "署名", "风格"),
+}
+
+# 有时效的「动态」键：超出 profile_dynamic_ttl_days 天就不再注入（只影响注入，不删库）
+PROFILE_DYNAMIC_KEYS = (
+    "近期情绪", "近期感受", "近期个人事件", "事件", "预算", "遗憾", "被提醒", "行为线索",
+)
+
+
+def _profile_key_priority(key: str) -> int:
+    k = (key or "").strip()
+    for pri, keys in PROFILE_KEY_PRIORITY.items():
+        if k in keys:
+            return pri
+    return 50
+
+
+def _profile_drop_dynamic(
+    d: dict, created_at: float | None, ttl_days: int
+) -> tuple[dict, list[str]]:
+    """按 TTL 去掉过期的动态键。返回 (保留的字典, 被去掉的键名列表)。
+
+    画像行的 created_at 只在内容被更新（合并/归一）时刷新，所以它是"这条画像
+    最近一次被改"的可靠时间锚点；ttl_days <= 0 表示不做时效过滤。
+    """
+    if not ttl_days or ttl_days <= 0 or not created_at:
+        return d, []
+    age_days = (time.time() - float(created_at)) / 86400.0
+    if age_days <= ttl_days:
+        return d, []
+    kept, dropped = {}, []
+    for k, v in d.items():
+        if k in PROFILE_DYNAMIC_KEYS:
+            dropped.append(k)
+        else:
+            kept[k] = v
+    return (kept or d), dropped
+
+
+def _pack_profile(
+    identity: str,
+    d: dict,
+    max_keys: int,
+    max_chars: int,
+    created_at: float | None = None,
+    ttl_days: int = 0,
+) -> str:
+    """把键值字典打包成一行画像。
+
+    超限时的取舍顺序（重要）：先按 TTL 去掉过期动态键 → 按优先级排序
+    （同优先级按键名）→ 超字数时从**最低优先级**开始丢，而不是按字母序。
+    """
+    work = dict(d or {})
+    if ttl_days:
+        work, _dropped = _profile_drop_dynamic(work, created_at, ttl_days)
+    items = sorted(work.items(), key=lambda kv: (-_profile_key_priority(kv[0]), kv[0]))
+    if len(items) > max_keys:
+        items = items[:max_keys]
+    while True:
+        content = "【画像】%s：%s" % (
+            identity,
+            "；".join("%s=%s" % (k, v) for k, v in items),
+        )
+        if len(content) <= max_chars or len(items) <= 1:
+            return content
+        # 丢当前优先级最低的那个（items 已按优先级降序，取最后一个）
+        items = items[:-1]
+
+
 # 命中这些词的消息才值得交给 LLM 判断（节省 token）
 class SmartMemory(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -71,6 +254,7 @@ class SmartMemory(Star):
         self._legacy_db = os.path.join(self.db_dir, "memory.db")  # 旧版单库（升级后仅迁移一次）
         self._ensured: set = set()       # 已初始化（建表）的 bot 库
         self._organizing: set = set()    # 正在整理的群，避免并发重复触发
+        self._consolidated: set = set()  # 已做过画像合并的 (库, 作用域)
         self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
 
     # ---------------- 数据库（按 bot self_id 分库） ----------------
@@ -84,8 +268,8 @@ class SmartMemory(Star):
         conn.row_factory = sqlite3.Row
         return conn
 
-    @staticmethod
-    def _schema(conn) -> None:
+    @classmethod
+    def _schema(cls, conn) -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS long_term (
@@ -142,7 +326,7 @@ class SmartMemory(Star):
         return db_path
 
     def _init_all_db(self):
-        """启动时为所有已存在的 memory_*.db 建表并清理过期。"""
+        """启动时为所有已存在的 memory_*.db 建表、清理过期，并合并同一人的多行画像。"""
         try:
             for name in os.listdir(self.db_dir):
                 if re.fullmatch(r"memory_[0-9A-Za-z_-]+\.db", name):
@@ -151,11 +335,39 @@ class SmartMemory(Star):
                         with closing(self._connect(p)) as conn, conn:
                             self._schema(conn)
                         self._cleanup_expired(p)
+                        # ★ 合并放这里：_ensure_db() 因为库里已登记会直接 return，
+                        #   放在那边的扫描永远不执行（老 bug）。
+                        self._consolidate_all_scopes(p)
                         self._ensured.add(p)
                     except Exception as e:
                         logger.warning(f"[SmartMemory] 初始化库 {name} 失败: {e}")
         except Exception as e:
             logger.warning(f"[SmartMemory] 扫描数据库目录失败: {e}")
+
+    def _consolidate_all_scopes(self, db_path: str) -> int:
+        """对某个库里的所有作用域做一次画像合并（幂等）。"""
+        total = 0
+        try:
+            scopes = [
+                row[0]
+                for row in self._connect(db_path).execute(
+                    "SELECT DISTINCT group_id FROM long_term"
+                )
+            ]
+            logger.info(
+                "[SmartMemory] 画像合并检查 %s：%d 个作用域",
+                os.path.basename(db_path), len(scopes),
+            )
+            for scope in scopes:
+                removed = self._consolidate_profiles(db_path, scope)
+                if removed:
+                    logger.info(
+                        "[SmartMemory] 画像合并完成 %s：删除冗余 %d 行", scope, removed
+                    )
+                total += removed
+        except Exception as e:
+            logger.warning(f"[SmartMemory] 画像合并扫描失败: {e}")
+        return total
 
     def _cleanup_expired(self, db_path: str):
         try:
@@ -245,10 +457,10 @@ class SmartMemory(Star):
                 if not attrs:
                     continue
                 kv = "；".join(f"{k}={v}" for k, v in attrs.items())
-                self._add_long(
-                    self_id, group_id, "system", uname, f"【画像】{uname}：{kv}",
-                    [uname] + list(attrs.keys()), "人物画像",
-                )
+                # ★ 2026-09-30：改成**按人合并写入**。原来是无脑 INSERT 一行新快照 →
+                #   同一个人的画像越堆越多（私聊实测 31 行 / 7,527 字，每轮注入的
+                #   「提问者本人档案」里 3 行有 2/3 是重复内容）。合并后同一人只留一行。
+                self._merge_profile(self_id, group_id, uname, attrs)
                 saved += 1
             # 要点记忆
             for m in data.get("memories") or []:
@@ -367,6 +579,196 @@ class SmartMemory(Star):
         except Exception as e:
             logger.warning(f"[SmartMemory] 短期记忆写入失败: {e}")
 
+    # 画像按人合并：同一份资料只留一行（新旧值同 key 时新值覆盖旧值），并限制长度。
+    _PROFILE_SUFFIX_RE = re.compile(r"[（(][^（()）]*[)）]\s*$")
+    PROFILE_MAX_KEYS = 24
+    PROFILE_MAX_CHARS = 900
+
+    @classmethod
+    def _profile_key(cls, uname: str) -> str:
+        """'昵称(1234567890)' → '昵称'（去掉尾部括号备注，避免同一人开两份档案）。"""
+        n = (uname or "").strip()
+        return (cls._PROFILE_SUFFIX_RE.sub("", n).strip() or n or "未知")
+
+    @staticmethod
+    def _rows_to_merged(rows) -> dict:
+        """把若干画像行按键值合并（按传入顺序，靠后的值胜出）。同义键归一化。"""
+        merged: dict[str, str] = {}
+        for r in rows:
+            body = r["content"] or ""
+            body = body.split("：", 1)[1] if "：" in body else body
+            for part in body.split("；"):
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                k, v = _canon_key(k), v.strip()
+                if k and v:
+                    merged[k] = v
+        return merged
+
+    def _merge_identity_rows(self, conn, identity: str, rows) -> int:
+        """把同一身份的画像行合并成一行（调用方负责事务）。返回删除的行数。"""
+        merged = self._rows_to_merged(rows)
+        if not merged:
+            return 0
+        content = _pack_profile(
+            identity, merged, self.PROFILE_MAX_KEYS, self.PROFILE_MAX_CHARS,
+            created_at=rows[-1]["created_at"] if "created_at" in rows[-1].keys() else None,
+            ttl_days=0,  # 合并的落盘长度不受 TTL 影响，TTL 只在注入前应用
+        )
+        kws = ",".join([identity] + [k for k, _ in _sorted_pairs(merged)])[:200]
+        latest = rows[-1]["id"]
+        conn.execute(
+            "UPDATE long_term SET user_name=?, content=?, keywords=?, created_at=? "
+            "WHERE id=?",
+            (identity, content, kws, time.time(), latest),
+        )
+        ids = [r["id"] for r in rows if r["id"] != latest]
+        if ids:
+            conn.executemany("DELETE FROM long_term WHERE id=?", [(i,) for i in ids])
+        return len(ids)
+
+    def _run_canonical_pass(self, conn, group_id: str) -> int:
+        """把「同义键各占一份」的画像行重写成归一化键。
+
+        幂等：重写后的内容再次归一化结果不变，所以不需要任何标记位——
+        跑一次发现没有差异就是空操作（成本只有一次 SELECT）。
+
+        Returns:
+            被重写的行数。
+        """
+        changed = 0
+        rows = conn.execute(
+            "SELECT id, user_name, content, created_at FROM long_term "
+            "WHERE group_id=? AND content LIKE '【画像】%'",
+            (group_id,),
+        ).fetchall()
+        for r in rows:
+            ident = _profile_identity(r["content"] or "", r["user_name"] or "")
+            merged = self._rows_to_merged([r])
+            if not merged:
+                continue
+            content = _pack_profile(
+                ident, merged, self.PROFILE_MAX_KEYS, self.PROFILE_MAX_CHARS,
+                created_at=r["created_at"],
+                ttl_days=0,  # 归一化落盘不删动态键（保留数据），只在注入前按 TTL 过滤
+            )
+            if content == (r["content"] or ""):
+                continue
+            kws = ",".join([ident] + [k for k, _ in _sorted_pairs(merged)])[:200]
+            conn.execute(
+                "UPDATE long_term SET user_name=?, content=?, keywords=? WHERE id=?",
+                (ident, content, kws, r["id"]),
+            )
+            changed += 1
+        if changed:
+            logger.info("[SmartMemory] 画像同义键归一 %s：重写 %d 行", group_id, changed)
+            self._log(f"[画像归一] {group_id}: 同义键归一 {changed} 行")
+        return changed
+
+    def _consolidate_profiles(self, db_path: str, group_id: str) -> int:
+        """把一个作用域里同一人的多行画像合并成一行（幂等，自动执行）。
+
+        典型场景：历史遗留的「昵称（旧档）」快照与后来正名的「昵称」各占一行，
+        注入时一次带上好几段重复档案，把当轮对话语境挤掉。这里按键值合并：
+        最新的行胜出；旧行独有的键继续保留；结果统一成一行并刷新 created_at。
+
+        Returns:
+            被删除的冗余行数（0 表示无需合并/已处理过）。
+        """
+        scoped_key = (db_path, group_id)
+        if scoped_key in self._consolidated:
+            return 0
+        self._consolidated.add(scoped_key)
+        if not bool(self.config.get("auto_merge_profiles", True)):
+            return 0
+        try:
+            with closing(self._connect(db_path)) as conn, conn:
+                self._run_canonical_pass(conn, group_id)
+                rows = conn.execute(
+                    "SELECT id, user_name, content, created_at FROM long_term "
+                    "WHERE group_id=? AND content LIKE '【画像】%' "
+                    "ORDER BY created_at ASC, id ASC",
+                    (group_id,),
+                ).fetchall()
+                groups: dict[str, list] = {}
+                for r in rows:
+                    ident = _profile_identity(r["content"] or "", r["user_name"] or "")
+                    groups.setdefault(ident, []).append(r)
+                removed = 0
+                for ident, items in groups.items():
+                    if len(items) <= 1:
+                        continue
+                    removed += self._merge_identity_rows(conn, ident, items)
+                if removed:
+                    logger.info(
+                        "[SmartMemory] 画像自动合并 %s: %d 行 → %d 人（删除冗余 %d 行）",
+                        group_id, len(rows), len(groups), removed,
+                    )
+                    self._log(
+                        f"[画像合并] {group_id}: {len(rows)} 行 → {len(groups)} 人，删除 {removed} 行"
+                    )
+                return removed
+        except Exception as e:
+            logger.warning(f"[SmartMemory] 画像合并失败 {group_id}: {e}")
+            return 0
+
+    def _merge_profile(self, self_id, group_id, user_name, attrs):
+        """把这次提炼的 attrs 合并进该人已有的画像行（没有就新建）。只留一行。
+
+        - 同人识别用「归一化身份」（去掉尾部括号备注），所以 '昵称' 与
+          '昵称(1234567890)'、'昵称（旧档）' 会归并到同一行；
+        - 写完顺手把该身份的历史重复行一并合并（不再依赖启动时的一次性扫描）；
+        - 键按"新值覆盖旧值"，键数/总字数超上限时丢最早的键（那些事实通常也在要点记忆里）。
+        """
+        key = self._profile_key(user_name)
+        try:
+            with closing(self._connect(self._db_path(self_id))) as conn, conn:
+                cands = conn.execute(
+                    "SELECT id, user_name, content, created_at FROM long_term "
+                    "WHERE group_id=? AND content LIKE '【画像】%' "
+                    "ORDER BY created_at ASC, id ASC LIMIT 500",
+                    (group_id,),
+                ).fetchall()
+                same = [
+                    c for c in cands
+                    if _profile_identity(c["content"] or "", c["user_name"] or "") == key
+                ]
+                merged = self._rows_to_merged(same)
+                for k, v in (attrs or {}).items():
+                    k, v = _canon_key(str(k)), str(v).strip()
+                    if k and v:
+                        merged[k] = v
+                if not merged:
+                    return False
+                rows = list(same)
+                if not rows:
+                    # 该身份第一次建档：先插入一行占位，再走统一合并写回
+                    conn.execute(
+                        "INSERT INTO long_term (group_id, user_id, user_name, content, keywords, raw, created_at) "
+                        "VALUES (?,?,?,?,?,?,?)",
+                        (group_id, "system", key, f"【画像】{key}：", "", "人物画像", time.time()),
+                    )
+                    placeholder = conn.execute(
+                        "SELECT id, user_name, content, created_at FROM long_term "
+                        "WHERE group_id=? AND content=? ORDER BY id DESC LIMIT 1",
+                        (group_id, f"【画像】{key}："),
+                    ).fetchone()
+                    rows = [placeholder] if placeholder else []
+                if not rows:
+                    return False
+                self._merge_identity_rows(conn, key, rows)
+                return True
+        except Exception as e:
+            logger.warning(f"[SmartMemory] 画像合并写入失败，回退为新增: {e}")
+            try:
+                kv = "；".join(f"{k}={v}" for k, v in (attrs or {}).items())
+                self._add_long(self_id, group_id, "system", key, f"【画像】{key}：{kv}",
+                               [key] + list((attrs or {}).keys()), "人物画像")
+                return True
+            except Exception:
+                return False
+
     def _add_long(self, self_id, group_id, user_id, user_name, summary, keywords, raw):
         try:
             with closing(self._connect(self._db_path(self_id))) as conn, conn:
@@ -402,29 +804,61 @@ class SmartMemory(Star):
         scored = []
         time_level = self._detect_time_intent(query)
         time_since = self._since_ts(time_level) if time_level else 0.0
+        # ★ 纯语气/寒暄的短消息不做长期记忆召回。
+        #   实测：「好~」会靠"关键词命中"（kw in query）捞出 5 条/380 字与当下无关的旧记忆
+        #   （因为很多记忆的关键词就是「好~」「嘿嘿~」这类口头禅），而正文 gram 命中为 0。
+        #   对方口头禅频出的场景下这个坑很深，所以整条召回直接跳过。
+        weak_query = _is_weak_query(query) and group_id.startswith("priv_")
+        if weak_query:
+            logger.debug("[SmartMemory] 纯语气/寒暄消息，跳过长期记忆召回：%r", query)
+            return []
         for r in rows:
-            score = 0
             content = r["content"] or ""
+            uname = r["user_name"] or ""
+            # ★ 画像行 / 带保质期的「旧档」内容不参与普通关键词召回：
+            #   画像里常写着一堆口头禅，短句「唔....」会被 4-gram 打高分捞出来，
+            #   于是每轮都注入好几段过时档案，把当轮语境挤掉。
+            if _is_profile(content, uname) or _is_temp_recall(content, uname):
+                continue
+            score = 0
+            text_hit = False
             c_norm = _norm(content)
             # 关键词：原文与简体化后各命中一次（原/简混合也能对上）
             for kw in (r["keywords"] or "").split(","):
                 if kw and (kw in query or _norm(kw) in q_norm):
                     score += 2
+                    text_hit = True
             # 正文包含提问原文 / 提问的简体形式
             if query and (query in content or q_norm in c_norm):
                 score += 3
-            # 4-gram 重叠（原文 + 简体化各算一遍）
+                text_hit = True
+            # 4-gram 重叠（原文 + 简体化各算一遍），至少两个 gram 才算数，避免语气词擦边
             grams = self._grams(query) | self._grams(q_norm)
-            for gram in grams:
-                if gram and (gram in content or gram in c_norm):
-                    score += 1
-            # 时间意图命中：问“昨天/最近”这类时间词时，时间段内的记忆优先
-            if time_since and score == 0 and (r["created_at"] or 0) >= time_since:
+            gram_hits = sum(1 for gram in grams if gram and (gram in content or gram in c_norm))
+            if gram_hits:
+                score += min(gram_hits, 3)
+                if gram_hits >= 2:
+                    text_hit = True
+            # 时间意图命中：只给「本来就有文本相关性」的记忆加权，
+            # 绝不把毫不相关的行凭空塞进榜（原来 score==0 也 +2）
+            if time_since and text_hit and (r["created_at"] or 0) >= time_since:
                 score += 2
-            if score > 0:
+            min_score = max(1, int(self.config.get("min_score", 2) or 2))
+            if score >= min_score:
                 scored.append((score, r))
         scored.sort(key=lambda x: -x[0])
-        return [r for _, r in scored[:top_k]]
+        # 画像类记忆最多占少量名额，别把普通要点挤光
+        max_profiles = max(0, min(4, int(self.config.get("max_profile_memories", 1) or 0)))
+        picked, used_profiles = [], 0
+        for _s, r in scored:
+            if len(picked) >= top_k:
+                break
+            if _is_profile(r["content"] or "", r["user_name"] or ""):
+                if used_profiles >= max_profiles:
+                    continue
+                used_profiles += 1
+            picked.append(r)
+        return picked
 
     @staticmethod
     def _grams(s: str, n: int = 4):
@@ -456,7 +890,10 @@ class SmartMemory(Star):
         sql = (
             "SELECT * FROM long_term WHERE group_id = ? AND ("
             + " OR ".join(conds)
-            + ") ORDER BY (content LIKE '%画像%') DESC, created_at DESC LIMIT ?"
+            # ★ 2026-09-30：降级的历史快照（user_name 带「旧档」）不再占「本人档案」这一栏，
+            #   否则同一份资料会以 3~4 行的形式挤进每轮提示词。它们仍在库里、检索照样能捞。
+            + ") AND (user_name IS NULL OR user_name NOT LIKE '%旧档%')"
+            " ORDER BY (content LIKE '【画像】%') DESC, created_at DESC LIMIT ?"
         )
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
@@ -497,6 +934,36 @@ class SmartMemory(Star):
         now = datetime.now()
         week = "一二三四五六日"[now.weekday()]
         return now.strftime("%Y-%m-%d %H:%M") + f" 周{week}"
+
+    def _cfg_int(self, key: str, default: int, lo: int, hi: int) -> int:
+        """读一个整数配置并夹到 [lo, hi]，坏值回退默认。"""
+        try:
+            val = int(self.config.get(key, default))
+        except (TypeError, ValueError):
+            val = default
+        return max(lo, min(hi, val))
+
+    def _profile_for_inject(self, row, cap: int) -> str:
+        """把一条画像行整理成注入用的短文本。
+
+        与 store 的区别（关键）：这里按**优先级**排序并按 cap 丢最低优先级的键，
+        而不是像 _clip 那样直接砍尾巴——否则字母序靠前的高价值键会被保住，
+        「身份/关系/擅长」这类反而被截掉。动态键按 TTL 过滤。
+        """
+        raw = row["content"] or ""
+        ident = _profile_identity(raw, row["user_name"] or "")
+        merged = self._rows_to_merged([row])
+        if not merged:
+            return _clip(raw, cap)
+        ttl_days = self._cfg_int("profile_dynamic_ttl_days", 3, 0, 365)
+        try:
+            created_at = row["created_at"]
+        except Exception:
+            created_at = None
+        return _pack_profile(
+            ident, merged, self.PROFILE_MAX_KEYS, cap,
+            created_at=created_at, ttl_days=ttl_days,
+        )
 
     def _recent_short_since(self, self_id: str, group_id: str, since_ts: float, n: int = 10):
         try:
@@ -545,9 +1012,14 @@ class SmartMemory(Star):
             # 提问者本人档案/记忆兜底：问“你记得我吗/我平时怎样”时本人画像优先
             uid = str(event.get_sender_id() or "")
             uname = event.get_sender_name() or uid
-            if uid and (not mems or _PROBE_RE.search(query)):
+            if uid and (
+                _PROBE_RE.search(query)
+                or (not mems and bool(self.config.get("profile_fallback", True)))
+            ):
                 try:
-                    own = self._member_rows(self_id, group_id, uid, uname, 4)
+                    lim = self._cfg_int("profile_limit", 1, 1, 5)
+                    cap = self._cfg_int("profile_max_chars", 120, 40, 600)
+                    own = self._member_rows(self_id, group_id, uid, uname, lim)
                     if own:
                         dup = {m["id"] for m in (mems or [])}
                         own_lines = []
@@ -555,14 +1027,20 @@ class SmartMemory(Star):
                             if r["id"] in dup:
                                 continue
                             when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
-                            own_lines.append(f"- ({when} {r['user_name']}) {r['content']}")
+                            body = self._profile_for_inject(r, cap)
+                            own_lines.append(f"- ({when} {r['user_name']}) {body}")
                         if own_lines:
                             parts.append("【提问者本人档案/记忆，涉及ta自己或你俩关系时以此为准】\n"
-                                        + "\n".join(own_lines[:3]))
+                                        + "\n".join(own_lines[:lim]))
                 except Exception:
                     pass
             # 分层短期记忆：识别提问的时间意图（L2今天/L3最近几天/L4本周）
+            # ★ 私聊不再注入「今天的消息记录」：私聊没被 @ 的门槛，bot 手里就是完整会话历史，
+            #   这段记录是同一段对话的原样重复（实测「今天没有雨啦」被塞进 10 条/409 字，
+            #   而它本来就在上下文里）。群聊仍然需要——群里 bot 只看得到被唤醒那几条。
             level = self._detect_time_intent(query)
+            if level and group_id.startswith("priv_"):
+                level = None
             if level:
                 since = self._since_ts(level)
                 n = int(self.config.get("recent_count", 5)) * 2
@@ -585,7 +1063,10 @@ class SmartMemory(Star):
                     "请先引导用户说出更具体的关键词（人名/话题/事件），"
                     "再根据关键词检索上面的记忆和【记忆片段】后回答，不要凭空编造。"
                 )
-            elif self.config.get("include_recent", True):
+            elif (
+                self.config.get("include_recent", True)
+                and bool(self.config.get("inject_recent_list", False))
+            ):
                 n = int(self.config.get("recent_count", 5))
                 recent = self._recent_short(self_id, group_id, n)
                 if recent:
