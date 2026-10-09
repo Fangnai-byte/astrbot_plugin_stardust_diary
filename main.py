@@ -301,6 +301,8 @@ class SmartMemory(Star):
         self._ensured: set = set()       # 已初始化（建表）的 bot 库
         self._organizing: set = set()    # 正在整理的群，避免并发重复触发
         self._consolidated: set = set()  # 已做过画像合并的 (库, 作用域)
+        self._organize_backoff: dict = {}  # 群 -> 上次整理失败时间（失败退避用）
+        self._last_purge: float = 0.0      # 上次物理清理过期短期记忆的时间
         self._refresh_profile_names()    # 把自动识别到的 bot 名字并进画像别名
         self._log(
             f"[{self._log_tag()}] bot 名字: "
@@ -464,22 +466,35 @@ class SmartMemory(Star):
     # ---------------- 满阈值 AI 整理 ----------------
     async def _organize(self, self_id: str, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
-        if group_id in self._organizing:
+        # 键带上 self_id：两个 bot 同时挂在同一个群时，各自的整理不该互相挡
+        job_key = f"{self_id}:{group_id}"
+        if job_key in self._organizing:
             self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 正在整理中，跳过本次触发")
             return
-        self._organizing.add(group_id)
+        # 失败退避：解析失败 / 拿不到供应商时，若不加退避，下一条消息就会再烧一次
+        # 上万字符的请求（实测一次整理 15~45 秒），群活跃时等于按条计费地空转。
+        last_fail = self._organize_backoff.get(job_key, 0.0)
+        if last_fail and time.time() - last_fail < self.ORGANIZE_FAIL_BACKOFF:
+            return
+        self._organizing.add(job_key)
         try:
             self._log(f"[{self._log_tag(self_id)}] _organize 被调用，群 {group_id}")
-            msgs = self._all_short(self_id, group_id)
+            threshold = int(self.config.get("organize_threshold", 100))
+            # 取数上限不能小于阈值，否则阈值被调大后就永远凑不满、永远不整理
+            msgs = self._all_short(self_id, group_id, max(500, threshold))
             self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 缓冲 {len(msgs)} 条")
-            if len(msgs) < int(self.config.get("organize_threshold", 100)):
+            if len(msgs) < threshold:
                 return
+            # ★ 记下这批消息的最大 id：整理要跑十几秒，这期间新消息还在往缓冲里写，
+            #   收尾时只能删到这条为止，否则会**静默丢掉这段时间的新消息**。
+            watermark = self._short_watermark(msgs)
             text = "\n".join(
                 f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
             )[:12000]
             provider = self._pick_provider()
             self._log(f"[{self._log_tag(self_id)}] provider: {provider.meta().id if provider else None}")
             if provider is None:
+                self._organize_backoff[job_key] = time.time()
                 return
             resp = await provider.text_chat(
                 prompt=text,
@@ -502,6 +517,8 @@ class SmartMemory(Star):
             data = self._parse_json(out)
             self._log(f"[{self._log_tag(self_id)}] 解析结果: {bool(data)}")
             if not data:
+                self._organize_backoff[job_key] = time.time()
+                self._log(f"[{self._log_tag(self_id)}] 解析不出 JSON，{self.ORGANIZE_FAIL_BACKOFF}s 内不再重试本群")
                 return
             saved = 0
             # 人物画像
@@ -510,7 +527,6 @@ class SmartMemory(Star):
                 attrs = p.get("attrs") or {}
                 if not attrs:
                     continue
-                kv = "；".join(f"{k}={v}" for k, v in attrs.items())
                 # ★ 2026-09-30：改成**按人合并写入**。原来是无脑 INSERT 一行新快照 →
                 #   同一个人的画像越堆越多（私聊实测 31 行 / 7,527 字，每轮注入的
                 #   「提问者本人档案」里 3 行有 2/3 是重复内容）。合并后同一人只留一行。
@@ -526,13 +542,15 @@ class SmartMemory(Star):
                     m.get("keywords") or [], "要点提取",
                 )
                 saved += 1
-            # 清空缓冲，重新计数
-            self._clear_short(self_id, group_id)
+            # 清空缓冲（只删这一批，整理期间新到的消息留着下轮）
+            self._clear_short(self_id, group_id, watermark)
+            self._organize_backoff.pop(job_key, None)
             self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
+            self._organize_backoff[job_key] = time.time()
             self._log(f"[{self._log_tag(self_id)}] AI 整理失败: {e}")
         finally:
-            self._organizing.discard(group_id)
+            self._organizing.discard(job_key)
 
     # ---------------- bot 名字（按 bot 自动识别，代码里不写死角色名） ----------------
     def _plugin_display_name(self) -> str:
@@ -656,10 +674,21 @@ class SmartMemory(Star):
         """日志/落库标签：这个 bot 自己的名字，取不到才退回插件展示名。"""
         return self._bot_name(self_id)
 
+    LOG_MAX_BYTES = 1_000_000   # plugin.log 超过这么大就轮转一份（只留一代）
+
     def _log(self, msg: str):
-        """双写日志：astrbot 日志 + 独立文件（防 group_log_archive 清空源日志丢失）"""
+        """写插件自己的日志文件（astrbot.log 会被 group_log_archive 定期清空）。
+
+        超过 LOG_MAX_BYTES 就轮转成 plugin.log.1，避免无限增长。
+        """
+        path = os.path.join(self.db_dir, "plugin.log")
         try:
-            with open(os.path.join(self.db_dir, "plugin.log"), "a", encoding="utf-8") as f:
+            if os.path.exists(path) and os.path.getsize(path) > self.LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except Exception:
+            pass
+        try:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
         except Exception:
             pass
@@ -700,7 +729,18 @@ class SmartMemory(Star):
             return None
 
     def _save_plugin_config(self) -> None:
-        """把当前 self.config 写回插件配置文件（指令修改配置时用）"""
+        """把当前 self.config 写回插件配置文件（指令修改配置时用）。
+
+        优先走 `AstrBotConfig.save_config()`：它带写入版本号 + 临时文件原子替换，
+        能和 WebUI 的保存串行化，避免"后写的静默覆盖先写的"。失败才退回手写。
+        """
+        save = getattr(self.config, "save_config", None)
+        if callable(save):
+            try:
+                save()
+                return
+            except Exception as e:
+                logger.warning(f"[{self._log_tag()}] save_config() 失败，退回手写: {e}")
         try:
             cfg_path = os.path.join(
                 get_astrbot_data_path(), "config",
@@ -715,8 +755,8 @@ class SmartMemory(Star):
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
-                    "SELECT COUNT(*) FROM short_term WHERE group_id = ?",
-                    (group_id,),
+                    "SELECT COUNT(*) FROM short_term WHERE group_id = ? AND expire_at > ?",
+                    (group_id, time.time()),
                 ).fetchone()[0]
         except Exception:
             return 0
@@ -725,21 +765,41 @@ class SmartMemory(Star):
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
-                    "SELECT * FROM short_term WHERE group_id = ? "
+                    "SELECT * FROM short_term WHERE group_id = ? AND expire_at > ? "
                     "ORDER BY created_at ASC LIMIT ?",
-                    (group_id, limit),
+                    (group_id, time.time(), limit),
                 ).fetchall()
         except Exception:
             return []
 
-    def _clear_short(self, self_id: str, group_id: str):
+    def _short_watermark(self, msgs) -> int:
+        """这批消息里最大的 id；清缓冲时只删到它为止。"""
+        try:
+            return max(int(r["id"]) for r in msgs)
+        except Exception:
+            return 0
+
+    def _clear_short(self, self_id: str, group_id: str, upto_id: int | None = None):
+        """清缓冲。
+
+        `upto_id` 非空时**只删到那条为止**：整理要跑十几秒，这期间新消息持续
+        进缓冲，一刀切会把它们和已处理的一起删掉（静默丢记忆）。
+        """
         try:
             with closing(self._connect(self._db_path(self_id))) as conn, conn:
-                conn.execute(
-                    "DELETE FROM short_term WHERE group_id = ?", (group_id,)
-                )
+                if upto_id is None:
+                    # 显式要求"清空"（旧行为）；正常整理路径一律走下面的水位线分支
+                    conn.execute(
+                        "DELETE FROM short_term WHERE group_id = ?", (group_id,)
+                    )
+                else:
+                    # upto_id 取不到（=0）时这条删不到任何行 —— 宁可不删，也不能误删新消息
+                    conn.execute(
+                        "DELETE FROM short_term WHERE group_id = ? AND id <= ?",
+                        (group_id, int(upto_id)),
+                    )
         except Exception as e:
-            logger.warning(f"[{self._log_tag()}] 清空缓冲失败: {e}")
+            logger.warning(f"[{self._log_tag(self_id)}] 清空缓冲失败: {e}")
 
     # ---------------- 存储 ----------------
     def _add_short(self, self_id, group_id, user_id, user_name, text):
@@ -754,11 +814,17 @@ class SmartMemory(Star):
                 )
         except Exception as e:
             logger.warning(f"[SmartMemory] 短期记忆写入失败: {e}")
+        # 过期行原本只在插件启动时清一次，长跑时短期表会一直涨、过期消息也还在被读。
+        # 这里顺手每小时物理清一次（按 bot 库）。
+        if now - self._last_purge > 3600:
+            self._last_purge = now
+            self._cleanup_expired(self._db_path(self_id))
 
     # 画像按人合并：同一份资料只留一行（新旧值同 key 时新值覆盖旧值），并限制长度。
     _PROFILE_SUFFIX_RE = re.compile(r"[（(][^（()）]*[)）]\s*$")
     PROFILE_MAX_KEYS = 24
     PROFILE_MAX_CHARS = 900
+    ORGANIZE_FAIL_BACKOFF = 120   # 整理失败后，本群多少秒内不再重试（防按条烧 token）
 
     @classmethod
     def _profile_key(cls, uname: str) -> str:
@@ -782,17 +848,24 @@ class SmartMemory(Star):
                     merged[k] = v
         return merged
 
-    def _merge_identity_rows(self, conn, identity: str, rows) -> int:
-        """把同一身份的画像行合并成一行（调用方负责事务）。返回删除的行数。"""
-        merged = self._rows_to_merged(rows)
-        if not merged:
+    def _merge_identity_rows(self, conn, identity: str, rows, merged: dict | None = None) -> int:
+        """把同一身份的画像行合并成一行（调用方负责事务）。返回删除的行数。
+
+        `merged` 是调用方已经算好的键值（行里的旧值 + 本次新提炼的），它**必须**
+        参与最终写入——早期版本这里只从 `rows` 重算，导致 `_merge_profile` 里辛苦
+        合进去的新键值被整个丢掉（新建的人永远是一行空壳、老人的画像永不更新）。
+        """
+        work = self._rows_to_merged(rows)
+        if merged:
+            work.update(merged)
+        if not work:
             return 0
         content = _pack_profile(
-            identity, merged, self.PROFILE_MAX_KEYS, self.PROFILE_MAX_CHARS,
+            identity, work, self.PROFILE_MAX_KEYS, self.PROFILE_MAX_CHARS,
             created_at=rows[-1]["created_at"] if "created_at" in rows[-1].keys() else None,
             ttl_days=0,  # 合并的落盘长度不受 TTL 影响，TTL 只在注入前应用
         )
-        kws = ",".join([identity] + [k for k, _ in _sorted_pairs(merged)])[:200]
+        kws = ",".join([identity] + [k for k, _ in _sorted_pairs(work)])[:200]
         latest = rows[-1]["id"]
         conn.execute(
             "UPDATE long_term SET user_name=?, content=?, keywords=?, created_at=? "
@@ -933,7 +1006,10 @@ class SmartMemory(Star):
                     rows = [placeholder] if placeholder else []
                 if not rows:
                     return False
-                self._merge_identity_rows(conn, key, rows)
+                # ★ merged 必须传进去：只传 rows 的话，本次新提炼的键值会被
+                #   _merge_identity_rows 内部的"从 rows 重算"覆盖掉（老 bug，
+                #   表现为新人画像永远是空壳、老人画像永不更新）
+                self._merge_identity_rows(conn, key, rows, merged)
                 return True
         except Exception as e:
             logger.warning(f"[SmartMemory] 画像合并写入失败，回退为新增: {e}")
@@ -965,14 +1041,20 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 长期记忆写入失败: {e}")
 
     # ---------------- 检索 ----------------
+    # 检索扫描窗口（按 created_at 倒序取这么多行再打分）。
+    # 原为 600：实测某群长期记忆已 3647 行，等于**最近 600 条以外的老记忆永远检索不到**。
+    # 实测成本：扫 600 行 ≈1.9ms / 3647 行 ≈15ms（单次查询，本机），所以放宽到 5000 几乎无感。
+    SEARCH_SCAN_LIMIT = 5000
+
     def _search_long(self, self_id: str, group_id: str, query: str, top_k: int = 5):
         query = (query or "").strip()
         q_norm = _norm(query)
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
                 rows = conn.execute(
-                    "SELECT * FROM long_term WHERE group_id = ? ORDER BY created_at DESC LIMIT 600",
-                    (group_id,),
+                    "SELECT * FROM long_term WHERE group_id = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (group_id, self.SEARCH_SCAN_LIMIT),
                 ).fetchall()
         except Exception as e:
             logger.warning(f"[SmartMemory] 检索失败: {e}")
@@ -1146,8 +1228,8 @@ class SmartMemory(Star):
             with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
                     "SELECT * FROM short_term WHERE group_id = ? AND created_at >= ? "
-                    "ORDER BY created_at DESC LIMIT ?",
-                    (group_id, since_ts, n),
+                    "AND expire_at > ? ORDER BY created_at DESC LIMIT ?",
+                    (group_id, since_ts, time.time(), n),
                 ).fetchall()
         except Exception:
             return []
