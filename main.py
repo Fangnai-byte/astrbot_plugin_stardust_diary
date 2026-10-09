@@ -74,7 +74,10 @@ def _is_profile(content: str, user_name: str = "") -> bool:
 
 
 def _profile_identity(content: str, user_name: str) -> str:
-    """画像行归一化身份：优先取正文『【画像】X：』里的 X，否则退回 user_name。"""
+    """画像行归一化身份（= 显示名）：优先取正文『【画像】X：』里的 X，否则退回 user_name。
+
+    注意：这是**显示名**，会随昵称改而变；做分组请用 `_profile_group_key()`。
+    """
     c = (content or "").lstrip()
     if c.startswith("【画像】"):
         rest = c[len("【画像】"):]
@@ -84,6 +87,51 @@ def _profile_identity(content: str, user_name: str) -> str:
                 if name:
                     return SmartMemory._profile_key(name)
     return SmartMemory._profile_key(user_name)
+
+
+# 画像正文里的 QQ（分组锚点）：`QQ=123456` / `QQ：123456`
+_PROFILE_QQ_RE = re.compile(r"QQ\s*[=:：]\s*(\d{5,12})")
+
+
+def _profile_qq(content: str) -> str:
+    """从画像正文里取 QQ（取不到返回空串）。"""
+    m = _PROFILE_QQ_RE.search(content or "")
+    return m.group(1) if m else ""
+
+
+def _profile_group_key(content: str, user_name: str) -> str:
+    """画像的**分组键**：优先 QQ，取不到才退回归一化昵称。
+
+    为什么不用昵称：昵称会改（`旧昵称` → `新昵称`），
+    只按昵称分组会把同一个人裂成好几行档案（线上实测有人裂成 7 行）。
+    QQ 是不变的锚点。
+    """
+    qq = _profile_qq(content)
+    if qq:
+        return "qq:" + qq
+    return "name:" + SmartMemory._profile_key(user_name)
+
+
+def _resolve_qq(name: str, nick2qq: dict) -> str:
+    """把 LLM 返回的昵称认回 QQ。
+
+    顺序：昵称里自带的 `(123456)`（prompt 里喂给模型的就是 `昵称(QQ)`）→
+    与缓冲里的昵称精确匹配 → 去掉尾部括号备注后再匹配 → 只有唯一子串候选时才认。
+    认不出来就返回空串（那就退回按昵称分组，与旧行为一致）。
+    """
+    n = (name or "").strip()
+    if not n or not nick2qq:
+        return ""
+    m = re.search(r"[（(]\s*(\d{5,12})\s*[)）]", n)
+    if m:
+        return m.group(1)
+    if n in nick2qq:
+        return str(nick2qq[n])
+    cleaned = SmartMemory._profile_key(n)
+    if cleaned in nick2qq:
+        return str(nick2qq[cleaned])
+    cands = {str(q) for k, q in nick2qq.items() if k and (cleaned in k or k in cleaned)}
+    return cands.pop() if len(cands) == 1 else ""
 
 
 def _is_temp_recall(content: str, user_name: str = "") -> bool:
@@ -203,8 +251,8 @@ def _is_weak_query(query: str) -> bool:
 # 目的：注入有字数上限时，别按字母序瞎丢——把"他是谁/你俩什么关系"留下，
 # 把项目版本号、预算这类低价值键挤出去。
 PROFILE_KEY_PRIORITY = {
-    # 90：核心身份与关系，永远优先
-    90: ("身份", "身份补充", "关系", "称呼", "擅长", "语言", "身体", "昵称"),
+    # 90：核心身份与关系，永远优先（QQ 是画像分组锚点，丢了会导致同人裂成多行）
+    90: ("身份", "身份补充", "关系", "称呼", "擅长", "语言", "身体", "昵称", "QQ"),
     # 70：稳定偏好与互动方式
     70: ("喜欢", "互动", "互动方式", "习惯", "习惯动作", "口头禅", "饮食", "在意",
          "关心", "近期情绪", "近期感受", "近期个人事件", "重要态度", "遗憾", "事件",
@@ -521,16 +569,25 @@ class SmartMemory(Star):
                 self._log(f"[{self._log_tag(self_id)}] 解析不出 JSON，{self.ORGANIZE_FAIL_BACKOFF}s 内不再重试本群")
                 return
             saved = 0
+            # 昵称 → QQ 映射（本次缓冲里的真实发言者）：LLM 只回昵称，这里把昵称认回 QQ，
+            # 作为画像的分组锚点，免得对方一改昵称就另开一行档案。
+            nick2qq: dict[str, str] = {}
+            for r in msgs:
+                n = (r["user_name"] or "").strip()
+                u = str(r["user_id"] or "").strip()
+                if n and u and u != "system":
+                    nick2qq[n] = u
             # 人物画像
             for p in data.get("profiles") or []:
                 uname = str(p.get("user", "")).strip() or "未知"
                 attrs = p.get("attrs") or {}
                 if not attrs:
                     continue
+                qq = _resolve_qq(uname, nick2qq) if self._identity_mode() == "qq" else ""
                 # ★ 2026-09-30：改成**按人合并写入**。原来是无脑 INSERT 一行新快照 →
                 #   同一个人的画像越堆越多（私聊实测 31 行 / 7,527 字，每轮注入的
                 #   「提问者本人档案」里 3 行有 2/3 是重复内容）。合并后同一人只留一行。
-                self._merge_profile(self_id, group_id, uname, attrs)
+                self._merge_profile(self_id, group_id, uname, attrs, qq=qq)
                 saved += 1
             # 要点记忆
             for m in data.get("memories") or []:
@@ -587,7 +644,7 @@ class SmartMemory(Star):
     def _configured_platform_names(self) -> list[str]:
         """AstrBot 全局配置里的所有平台实例名（**含未启用的**）。
 
-        另一个 bot 平时可能是关着的（如乙），但它的记忆库还在，
+        另一个 bot 平时可能是关着的（比如暂时停用的那个），但它的记忆库还在，
         先把名字认下来，画像键归一 / 启动日志才不会漏。
         """
         try:
@@ -940,14 +997,18 @@ class SmartMemory(Star):
                     "ORDER BY created_at ASC, id ASC",
                     (group_id,),
                 ).fetchall()
+                # ★ 分组按 QQ（`_profile_group_key`），不按昵称：昵称改了就换一行档案的坑
                 groups: dict[str, list] = {}
                 for r in rows:
-                    ident = _profile_identity(r["content"] or "", r["user_name"] or "")
-                    groups.setdefault(ident, []).append(r)
+                    gk = self._profile_group_key(r["content"] or "", r["user_name"] or "")
+                    groups.setdefault(gk, []).append(r)
                 removed = 0
-                for ident, items in groups.items():
+                for _gk, items in groups.items():
                     if len(items) <= 1:
                         continue
+                    # 显示名取最新那行的昵称（分组键可能是 "qq:123" 这种，不能当名字）
+                    newest = items[-1]
+                    ident = _profile_identity(newest["content"] or "", newest["user_name"] or "")
                     removed += self._merge_identity_rows(conn, ident, items)
                 if removed:
                     logger.info(
@@ -962,15 +1023,35 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 画像合并失败 {group_id}: {e}")
             return 0
 
-    def _merge_profile(self, self_id, group_id, user_name, attrs):
+    def _identity_mode(self) -> str:
+        """画像认人方式：`qq`（默认，按 QQ）或 `name`（退回只按昵称，1.6.2 的旧行为）。"""
+        mode = str(self.config.get("profile_identity_mode", "qq") or "qq").strip().lower()
+        return mode if mode in ("qq", "name") else "qq"
+
+    def _profile_group_key(self, content: str, user_name: str) -> str:
+        """画像分组键（受 `profile_identity_mode` 控制）。"""
+        if self._identity_mode() == "name":
+            return "name:" + self._profile_key(user_name)
+        return _profile_group_key(content, user_name)
+
+    def _merge_profile(self, self_id, group_id, user_name, attrs, qq: str = ""):
         """把这次提炼的 attrs 合并进该人已有的画像行（没有就新建）。只留一行。
 
-        - 同人识别用「归一化身份」（去掉尾部括号备注），所以 '昵称' 与
-          '昵称(1234567890)'、'昵称（旧档）' 会归并到同一行；
+        - 同人识别**优先用 QQ**（`qq` 参数，或正文里已有的 `QQ=`）；没有 QQ 时才退回
+          「归一化昵称」（去掉尾部括号备注）。只按昵称认人的话，对方一改昵称就会被
+          当成新的人、另开一行档案（线上实测有人裂成 7 行）；
+        - 双方 QQ 都有且不同 → 明确是别人，即使昵称撞了也不合并；
         - 写完顺手把该身份的历史重复行一并合并（不再依赖启动时的一次性扫描）；
         - 键按"新值覆盖旧值"，键数/总字数超上限时丢最早的键（那些事实通常也在要点记忆里）。
         """
         key = self._profile_key(user_name)
+        qq = str(qq or "").strip()
+        if self._identity_mode() == "name":
+            qq = ""            # 配置成按昵称认人时，不写 QQ 锚点、也不按 QQ 分组
+        attrs = dict(attrs or {})
+        if qq:
+            # 把 QQ 写进正文：它是之后分组的锚点（也是 90 档高优先键，不会被裁掉）
+            attrs["QQ"] = qq
         try:
             with closing(self._connect(self._db_path(self_id))) as conn, conn:
                 cands = conn.execute(
@@ -979,12 +1060,18 @@ class SmartMemory(Star):
                     "ORDER BY created_at ASC, id ASC LIMIT 500",
                     (group_id,),
                 ).fetchall()
-                same = [
-                    c for c in cands
-                    if _profile_identity(c["content"] or "", c["user_name"] or "") == key
-                ]
+                same = []
+                for c in cands:
+                    row_qq = _profile_qq(c["content"] or "")
+                    row_name = _profile_identity(c["content"] or "", c["user_name"] or "")
+                    if qq and row_qq:
+                        if row_qq == qq:
+                            same.append(c)      # QQ 相同 → 同一人（昵称改了也认）
+                        # QQ 不同 → 是别人，昵称撞了也不并
+                    elif row_name == key:
+                        same.append(c)          # 至少一边没有 QQ，只能按昵称认
                 merged = self._rows_to_merged(same)
-                for k, v in (attrs or {}).items():
+                for k, v in attrs.items():
                     k, v = _canon_key(str(k)), str(v).strip()
                     if k and v:
                         merged[k] = v
