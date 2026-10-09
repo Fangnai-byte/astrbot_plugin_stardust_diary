@@ -52,6 +52,8 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 | `profile_max_chars` | 每条画像注入的最大字符数（超出按优先级裁剪） | `120` |
 | `profile_dynamic_ttl_days` | 动态条目（近期情绪/事件/预算…）的注入保质期，`0` 关闭 | `3` |
 | `auto_merge_profiles` | 自动合并同一人的多行画像 | `true` |
+| `profile_names` | 画像键归并用的「对方名字」（逗号分隔）。填了之后「与<名字>关系」归一到「关系」，「<名字>反应」进高优先保留档。**bot 自己的名字不用填，会自动识别** | 空 |
+| `bot_names` | 按 bot 指定名字（可选）。留空自动用 AstrBot 里该 bot 的平台实例名（UMO 前缀，如 `甲`/`乙`），日志标签与落库 `user_name` 都用它；格式 `QQ号=名字, QQ号=名字` | 空 |
 | `short_retain_days` | 短期缓冲保留天数（决定"最近三天"能问多久） | `3` |
 
 ## 使用

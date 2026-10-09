@@ -112,9 +112,45 @@ _PROFILE_KEY_ALIASES = {
     "常用命令": "命令",
     "github仓库": "重要仓库", "相关仓库": "重要仓库", "github相关": "重要仓库",
     "喜欢/偏好": "喜欢", "喜欢/在意": "喜欢",
-    "与宁宁关系": "关系", "与fangnai关系": "关系",
     "被评价": "评价",
 }
+
+# 「与<某人>关系」→「关系」、「<某人>反应」进高优先档，取决于 _PROFILE_NAMES 里有哪些名字。
+# 名字来源：配置项 profile_names（手填，例如对方的名字）+ **自动识别出来的各 bot 名字**
+# （AstrBot 平台实例名，或用 bot_names 配置显式指定）。代码里不写死任何角色名。
+_PROFILE_NAMES: tuple[str, ...] = ()
+
+
+def _split_names(raw) -> list[str]:
+    """把「逗号/顿号/分号/空格分隔的字符串」或列表拆成名字列表（保序去重）。"""
+    if isinstance(raw, str):
+        items = re.split(r"[,，、;；\s]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(x) for x in raw]
+    else:
+        items = []
+    out: list[str] = []
+    for x in items:
+        x = x.strip()
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def set_profile_names(raw) -> None:
+    """设置「画像别名名字」（覆盖用）。见 _canon_key / _profile_key_priority。"""
+    global _PROFILE_NAMES
+    _PROFILE_NAMES = tuple(_split_names(raw))
+
+
+def add_profile_names(extra) -> None:
+    """追加「画像别名名字」（自动识别出来的 bot 名字走这里，不覆盖手填的配置）。"""
+    global _PROFILE_NAMES
+    merged = list(_PROFILE_NAMES)
+    for x in _split_names(extra):
+        if x not in merged:
+            merged.append(x)
+    _PROFILE_NAMES = tuple(merged)
 
 
 def _canon_key(key: str) -> str:
@@ -122,7 +158,12 @@ def _canon_key(key: str) -> str:
     k = (key or "").strip()
     if not k:
         return k
-    return _PROFILE_KEY_ALIASES.get(k.lower(), k)
+    canon = _PROFILE_KEY_ALIASES.get(k.lower(), k)
+    low = canon.lower()
+    for name in _PROFILE_NAMES:
+        if low == f"与{name}关系".lower():
+            return "关系"
+    return canon
 
 
 # 纯语气词 / 寒暄：这类消息本身不含信息，拿它去检索长期记忆只会捞出无关旧事
@@ -169,7 +210,7 @@ PROFILE_KEY_PRIORITY = {
          "关心", "近期情绪", "近期感受", "近期个人事件", "重要态度", "遗憾", "事件",
          "共同记忆", "互动事件", "亲密互动方式", "问候习惯", "日常", "特征",
          "生理反应", "手", "家", "技能", "早餐", "评价", "行为线索", "被提醒",
-         "备注", "宁宁反应"),
+         "备注"),
     # 50：默认档（未登记键）
     # 20：低价值元信息，最容易先丢
     20: ("项目", "项目版本", "预算", "挑战时长", "许可证决策", "许可偏好", "需求重点",
@@ -185,6 +226,9 @@ PROFILE_DYNAMIC_KEYS = (
 
 def _profile_key_priority(key: str) -> int:
     k = (key or "").strip()
+    for name in _PROFILE_NAMES:
+        if k == f"{name}反应":
+            return 70
     for pri, keys in PROFILE_KEY_PRIORITY.items():
         if k in keys:
             return pri
@@ -248,6 +292,8 @@ class SmartMemory(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        set_profile_names(config.get("profile_names", ""))
+        self._bot_names: dict[str, str] = {}   # self_id(QQ) -> 这个 bot 的名字（自动学到/配置指定）
         data_dir = get_astrbot_data_path()
         self.db_dir = os.path.join(data_dir, "smart_memory")
         os.makedirs(self.db_dir, exist_ok=True)
@@ -255,6 +301,13 @@ class SmartMemory(Star):
         self._ensured: set = set()       # 已初始化（建表）的 bot 库
         self._organizing: set = set()    # 正在整理的群，避免并发重复触发
         self._consolidated: set = set()  # 已做过画像合并的 (库, 作用域)
+        self._refresh_profile_names()    # 把自动识别到的 bot 名字并进画像别名
+        self._log(
+            f"[{self._log_tag()}] bot 名字: "
+            + ("、".join(self._known_bot_names()) or "（未识别，将随消息自动识别）")
+            + "；画像别名名字: "
+            + ("、".join(_PROFILE_NAMES) if _PROFILE_NAMES else "（无）")
+        )
         self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
 
     # ---------------- 数据库（按 bot self_id 分库） ----------------
@@ -399,6 +452,7 @@ class SmartMemory(Star):
 
         # 1. 消息进短期缓冲（按 bot 分库）
         self._ensure_db(self_id)
+        self._learn_bot_name(self_id, event)   # 顺手识别这个 bot 叫什么（UMO 前缀）
         self._add_short(self_id, group_id, user_id, user_name, text)
 
         # 2. 满阈值触发 AI 整理（异步，不阻塞回复）
@@ -411,20 +465,20 @@ class SmartMemory(Star):
     async def _organize(self, self_id: str, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
         if group_id in self._organizing:
-            self._log(f"[绫地宁宁] 群 {group_id} 正在整理中，跳过本次触发")
+            self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 正在整理中，跳过本次触发")
             return
         self._organizing.add(group_id)
         try:
-            self._log(f"[绫地宁宁] _organize 被调用，群 {group_id}")
+            self._log(f"[{self._log_tag(self_id)}] _organize 被调用，群 {group_id}")
             msgs = self._all_short(self_id, group_id)
-            self._log(f"[绫地宁宁] 群 {group_id} 缓冲 {len(msgs)} 条")
+            self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 缓冲 {len(msgs)} 条")
             if len(msgs) < int(self.config.get("organize_threshold", 100)):
                 return
             text = "\n".join(
                 f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
             )[:12000]
             provider = self._pick_provider()
-            self._log(f"[绫地宁宁] provider: {provider.meta().id if provider else None}")
+            self._log(f"[{self._log_tag(self_id)}] provider: {provider.meta().id if provider else None}")
             if provider is None:
                 return
             resp = await provider.text_chat(
@@ -444,9 +498,9 @@ class SmartMemory(Star):
             out = "".join(
                 [c.text for c in (resp.result_chain.chain if resp.result_chain else []) if isinstance(c, Plain)]
             )
-            self._log(f"[绫地宁宁] LLM 返回前100字: {out[:100]!r}")
+            self._log(f"[{self._log_tag(self_id)}] LLM 返回前100字: {out[:100]!r}")
             data = self._parse_json(out)
-            self._log(f"[绫地宁宁] 解析结果: {bool(data)}")
+            self._log(f"[{self._log_tag(self_id)}] 解析结果: {bool(data)}")
             if not data:
                 return
             saved = 0
@@ -468,17 +522,139 @@ class SmartMemory(Star):
                 if not content:
                     continue
                 self._add_long(
-                    self_id, group_id, "system", "绫地宁宁", content[:200],
+                    self_id, group_id, "system", self._log_tag(self_id), content[:200],
                     m.get("keywords") or [], "要点提取",
                 )
                 saved += 1
             # 清空缓冲，重新计数
             self._clear_short(self_id, group_id)
-            self._log(f"[绫地宁宁] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
+            self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
         except Exception as e:
-            self._log(f"[绫地宁宁] AI 整理失败: {e}")
+            self._log(f"[{self._log_tag(self_id)}] AI 整理失败: {e}")
         finally:
             self._organizing.discard(group_id)
+
+    # ---------------- bot 名字（按 bot 自动识别，代码里不写死角色名） ----------------
+    def _plugin_display_name(self) -> str:
+        """插件展示名（最后的兜底标签）。"""
+        try:
+            meta = self.context.get_registered_star("astrbot_plugin_stardust_diary")
+            name = getattr(meta, "display_name", None) or getattr(meta, "name", None)
+            if name:
+                return str(name)
+        except Exception:
+            pass
+        return "astrbot_plugin_stardust_diary"
+
+    def _platform_instance_names(self) -> list[str]:
+        """AstrBot 里配置的平台实例名。
+
+        用户给每个 bot 起的实例名，也正是 unified_msg_origin 的前缀
+        （`平台实例名:消息类型:会话号`），多 bot 时天然区分（甲 / 乙）。
+        """
+        try:
+            insts = list(self.context.platform_manager.platform_insts or [])
+        except Exception:
+            insts = []
+        out: list[str] = []
+        for inst in insts:
+            try:
+                n = str(getattr(inst.meta(), "id", "") or "").strip()
+            except Exception:
+                continue
+            if n and n not in out:
+                out.append(n)
+        return out
+
+    def _configured_platform_names(self) -> list[str]:
+        """AstrBot 全局配置里的所有平台实例名（**含未启用的**）。
+
+        另一个 bot 平时可能是关着的（如乙），但它的记忆库还在，
+        先把名字认下来，画像键归一 / 启动日志才不会漏。
+        """
+        try:
+            plats = self.context.get_config().get("platform", []) or []
+        except Exception:
+            return []
+        out: list[str] = []
+        for p in plats:
+            if isinstance(p, dict):
+                n = str(p.get("id", "") or "").strip()
+            else:
+                n = str(getattr(p, "id", "") or "").strip()
+            if n and n not in out:
+                out.append(n)
+        return out
+
+    def _cfg_bot_names(self) -> dict[str, str]:
+        """配置项 bot_names：`10001=甲, 10002=乙`（也支持列表）。"""
+        raw = self.config.get("bot_names", "") or ""
+        out: dict[str, str] = {}
+        for item in _split_names(raw):
+            if "=" not in item:
+                continue
+            k, v = item.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k and v:
+                out[k] = v
+        return out
+
+    def _known_bot_names(self) -> list[str]:
+        """目前认得的所有 bot 名字（配置 + 平台实例 + 从消息学到）。"""
+        out: list[str] = []
+        for n in (
+            list(self._cfg_bot_names().values())
+            + self._platform_instance_names()
+            + self._configured_platform_names()
+            + list(self._bot_names.values())
+        ):
+            n = str(n or "").strip()
+            if n and n not in out:
+                out.append(n)
+        return out
+
+    def _bot_name(self, self_id=None) -> str:
+        """**这个 bot 自己**的名字。
+
+        顺序：`bot_names` 配置指定 > 从消息事件学到的平台实例名 >
+        全局只有一个平台实例时就用它 > 插件展示名。
+        """
+        sid = str(self_id or "").strip()
+        if sid:
+            n = self._cfg_bot_names().get(sid) or self._bot_names.get(sid)
+            if n:
+                return str(n)
+        names = self._platform_instance_names()
+        if len(names) == 1:
+            return names[0]
+        return self._plugin_display_name()
+
+    def _refresh_profile_names(self) -> None:
+        """把自动识别到的 bot 名字并进「画像别名名字」（手填的 profile_names 不动）。"""
+        add_profile_names(
+            list(self._cfg_bot_names().values())
+            + self._platform_instance_names()
+            + self._configured_platform_names()
+        )
+
+    def _learn_bot_name(self, self_id: str, event) -> None:
+        """从消息事件学「这个 QQ 的 bot 叫什么」——UMO 前缀就是平台实例名。"""
+        try:
+            sid = str(self_id or "").strip()
+            umo = str(getattr(event, "unified_msg_origin", "") or "")
+            name = umo.split(":", 1)[0].strip()
+            if not sid or not name or name == sid:
+                return
+            if self._bot_names.get(sid) != name:
+                self._bot_names[sid] = name
+                add_profile_names([name])
+                self._log(f"[{self._log_tag(sid)}] 识别到 bot 名字: {name}（self_id={sid}）")
+        except Exception as e:
+            logger.debug(f"[SmartMemory] 识别 bot 名字失败（忽略）: {e}")
+
+    def _log_tag(self, self_id=None) -> str:
+        """日志/落库标签：这个 bot 自己的名字，取不到才退回插件展示名。"""
+        return self._bot_name(self_id)
 
     def _log(self, msg: str):
         """双写日志：astrbot 日志 + 独立文件（防 group_log_archive 清空源日志丢失）"""
@@ -517,10 +693,10 @@ class SmartMemory(Star):
                 p = self.context.get_provider_by_id(pid)
                 if p is not None:
                     return p
-                logger.warning(f"[绫地宁宁] 供应商 {pid} 不存在，改用当前模型")
+                logger.warning(f"[{self._log_tag()}] 供应商 {pid} 不存在，改用当前模型")
             return self.context.get_using_provider()
         except Exception as e:
-            logger.warning(f"[绫地宁宁] 选择供应商失败: {e}")
+            logger.warning(f"[{self._log_tag()}] 选择供应商失败: {e}")
             return None
 
     def _save_plugin_config(self) -> None:
@@ -533,7 +709,7 @@ class SmartMemory(Star):
             with open(cfg_path, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.warning(f"[绫地宁宁] 保存插件配置失败: {e}")
+            logger.warning(f"[{self._log_tag()}] 保存插件配置失败: {e}")
 
     def _count_short(self, self_id: str, group_id: str) -> int:
         try:
@@ -563,7 +739,7 @@ class SmartMemory(Star):
                     "DELETE FROM short_term WHERE group_id = ?", (group_id,)
                 )
         except Exception as e:
-            logger.warning(f"[绫地宁宁] 清空缓冲失败: {e}")
+            logger.warning(f"[{self._log_tag()}] 清空缓冲失败: {e}")
 
     # ---------------- 存储 ----------------
     def _add_short(self, self_id, group_id, user_id, user_name, text):
