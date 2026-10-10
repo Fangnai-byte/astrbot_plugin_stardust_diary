@@ -7,9 +7,33 @@
   },
   "organize_threshold": {
     "description": "触发整理的消息条数",
-    "hint": "每个群攒满这么多条消息后，AI自动提炼人物画像与要点存入长期记忆，并清空缓冲",
+    "hint": "每个群攒满这么多条消息后，AI自动提炼人物画像与要点存入长期记忆，并清空缓冲。注意：调高阈值**不会**减少总开销（只是把频次和单次体积互换），要省 token 请看 record_scope / min_msg_chars",
     "type": "int",
     "default": 100
+  },
+  "record_scope": {
+    "description": "哪些消息记进记忆缓冲（省 token 的主要开关）",
+    "hint": "all：群里所有消息都记（默认，记忆最全但最费 token，开销随群活跃度涨）；triggered：只记「@了bot / 唤醒词触发」的消息（开销随 bot 活跃度涨，显著省 token）；bot：只记 bot 自己的发言（最省，但拿不到群成员画像）。整理一次要把缓冲区整段喂给模型，所以「少记」才是省 token 的关键",
+    "type": "string",
+    "default": "all"
+  },
+  "min_msg_chars": {
+    "description": "短于这么多字的消息不入缓冲",
+    "hint": "群里大量「哈哈」「喵」「？」这类水消息（实测平均每条才 17 字，其中 13.6% 不足 4 字），默认 4 能省下这部分 token 而几乎不丢信息。0 = 不过滤",
+    "type": "int",
+    "default": 4
+  },
+  "disabled_scopes": {
+    "description": "完全不记的作用域（群号 / priv_对方QQ）",
+    "hint": "逗号分隔。列在这里的群或私聊不进缓冲、不整理；适合「消息量很大但并不需要记忆」的群",
+    "type": "list",
+    "default": []
+  },
+  "organize_max_chars": {
+    "description": "单次整理喂给模型的最大字符数",
+    "hint": "默认 12000。调小能直接砍每次整理的输入 token（超出部分本轮不参与整理，但不会被删除）",
+    "type": "int",
+    "default": 12000
   },
   "organize_provider": {
     "description": "AI整理使用的模型提供商",

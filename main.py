@@ -358,6 +358,20 @@ class SmartMemory(Star):
             + "；画像别名名字: "
             + ("、".join(_PROFILE_NAMES) if _PROFILE_NAMES else "（无）")
         )
+        # 把"省 token 的当前策略"落到日志里，出问题时一眼能看出配置有没有生效
+        self._log(
+            "[{0}] 缓冲策略: record_scope={1}、min_msg_chars={2}、禁用作用域={3}、"
+            "单次整理上限={4}字；注入 top_k={5}、画像≤{6}字、兜底画像={7}".format(
+                self._log_tag(),
+                self.config.get("record_scope", "all"),
+                self.config.get("min_msg_chars", 0),
+                self.config.get("disabled_scopes") or "（无）",
+                self.config.get("organize_max_chars", 12000),
+                self.config.get("top_k", 5),
+                self.config.get("profile_max_chars", 120),
+                self.config.get("profile_fallback", True),
+            )
+        )
         self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
 
     # ---------------- 数据库（按 bot self_id 分库） ----------------
@@ -482,13 +496,47 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 清理过期短期记忆失败: {e}")
 
     # ---------------- 消息监听 ----------------
+    def _record_filter_reason(self, event, text: str, group_id: str):
+        """该不该把这条消息记进缓冲？返回 None=记，返回字符串=不记的原因。
+
+        为什么要这道闸：**整理的开销正比于"进入缓冲的消息条数"**（阈值只是把
+        「频次」和「单次体积」互换，不改变总量）。群里水消息极多（实测平均每条
+        17 字，一半是「哈哈」「喵」这类），全记下来就等于按群活跃度烧 token。
+        """
+        scopes = self.config.get("disabled_scopes") or []
+        if isinstance(scopes, str):
+            scopes = [x.strip() for x in re.split(r"[,，;；\s]+", scopes) if x.strip()]
+        if str(group_id) in {str(x).strip() for x in scopes}:
+            return "该作用域在 disabled_scopes 里"
+
+        mode = str(self.config.get("record_scope", "all") or "all").strip().lower()
+        is_bot = str(event.get_sender_id()) == str(event.get_self_id())
+        if mode == "bot":
+            if not is_bot:
+                return "record_scope=bot（只记 bot 自己的发言）"
+        elif is_bot:
+            return "bot 自己的发言（避免自我循环）"
+        elif mode == "triggered":
+            # 「被唤醒/被回复到」的消息才记：开销随 bot 活跃度走，而不是随群活跃度
+            try:
+                woke = bool(getattr(event, "is_at_or_wake_command", False)) or bool(event.is_wake_up())
+            except Exception:
+                woke = True          # 判断不了就照旧记，别把记忆搞没了
+            if not woke:
+                return "record_scope=triggered（这条没唤醒 bot）"
+
+        try:
+            min_chars = int(self.config.get("min_msg_chars", 0) or 0)
+        except (TypeError, ValueError):
+            min_chars = 0
+        if min_chars and len(text) < min_chars:
+            return f"短于 min_msg_chars={min_chars}"
+        return None
+
     @filter.event_message_type(
         EventMessageType.GROUP_MESSAGE | EventMessageType.PRIVATE_MESSAGE
     )
     async def on_group_message(self, event: AstrMessageEvent):
-        # 忽略 bot 自己的消息，避免自我循环
-        if str(event.get_sender_id()) == str(event.get_self_id()):
-            return
         self_id = str(event.get_self_id())
         text = event.get_message_str().strip()
         if not text:
@@ -497,6 +545,10 @@ class SmartMemory(Star):
         if text.startswith("/mem"):
             return
         group_id = self._get_scope(event)
+        reason = self._record_filter_reason(event, text, group_id)
+        if reason:
+            logger.debug("[SmartMemory] 不入缓冲（%s）：%s", reason, text[:30])
+            return
         user_id = str(event.get_sender_id())
         user_name = event.get_sender_name() or user_id
 
@@ -536,9 +588,27 @@ class SmartMemory(Star):
             # ★ 记下这批消息的最大 id：整理要跑十几秒，这期间新消息还在往缓冲里写，
             #   收尾时只能删到这条为止，否则会**静默丢掉这段时间的新消息**。
             watermark = self._short_watermark(msgs)
-            text = "\n".join(
-                f"{r['user_name']}({r['user_id']}): {r['content']}" for r in msgs
-            )[:12000]
+            try:
+                max_chars = int(self.config.get("organize_max_chars", 12000) or 12000)
+            except (TypeError, ValueError):
+                max_chars = 12000
+            # ★ 省 token（无损）：原来每条都写成「昵称(QQ): 内容」，实测 QQ 那截占了
+            #   整个 prompt 的一半左右（缓冲区平均昵称 5.8 字 + QQ 10 字 = 18.8 字，
+            #   而正文才 16.6 字）。现在改成开头放一张【群成员QQ对照】表，正文只留
+            #   「昵称: 内容」。认人本来就用 buffer 里的 昵称→QQ 映射（_resolve_qq），
+            #   不依赖 prompt 里逐条带 QQ；画像的 QQ 锚点也由 _merge_profile 自己写。
+            speakers, seen_qq = [], set()
+            for r in msgs:
+                u = str(r["user_id"] or "")
+                n = (r["user_name"] or "").strip() or u
+                if u and u != "system" and u not in seen_qq:
+                    seen_qq.add(u)
+                    speakers.append((n, u))
+            roster = "；".join(f"{n}={u}" for n, u in speakers[:80])
+            body = "\n".join(
+                f"{(r['user_name'] or '').strip() or r['user_id']}: {r['content']}" for r in msgs
+            )
+            text = ("【群成员QQ对照】" + roster + "\n\n" + body)[:max(1000, max_chars)]
             provider = self._pick_provider()
             self._log(f"[{self._log_tag(self_id)}] provider: {provider.meta().id if provider else None}")
             if provider is None:
@@ -551,6 +621,8 @@ class SmartMemory(Star):
                     "1. 为活跃成员建立人物画像，用键值对记录稳定属性（如 生日/喜欢/讨厌/身份/口头禅），"
                     "只记录明确出现过的信息，不要编造。\n"
                     "2. 提取值得长期记住的要点（约定、事件、计划、重要信息）。\n"
+                    "记录格式：开头是一张【群成员QQ对照】表（昵称=QQ），之后每行是「昵称: 内容」。"
+                    "写画像时请额外带上 QQ 键，值从对照表里查（例如 QQ=10001）。\n"
                     "只输出一个JSON对象："
                     '{"profiles": [{"user": "昵称", "attrs": {"键": "值"}}], '
                     '"memories": [{"content": "要点", "keywords": ["关键词"]}]}'

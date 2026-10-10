@@ -39,7 +39,11 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 | 配置项 | 说明 | 默认 |
 | --- | --- | --- |
 | `organize_enabled` | 是否启用满阈值 AI 整理 | `true` |
-| `organize_threshold` | 每群触发整理的消息条数 | `100` |
+| `organize_threshold` | 每群触发整理的消息条数（**调高不省 token**，只是把频次与单次体积互换） | `100` |
+| `organize_max_chars` | 单次整理喂给模型的最大字符数 | `12000` |
+| **`record_scope`** | **哪些消息记进缓冲（省 token 主开关）**：`all` 全记 / `triggered` 只记唤醒 bot 的 / `bot` 只记 bot 自己的发言 | `all` |
+| **`min_msg_chars`** | 短于这么多字的消息不入缓冲（过滤「哈哈」「喵」这类水消息） | `0`（不过滤） |
+| **`disabled_scopes`** | 完全不记的作用域（群号 / `priv_对方QQ`，逗号分隔） | 空 |
 | `organize_provider` | AI 整理使用的模型提供商（下拉选择，留空跟随当前对话模型） | 空 |
 | `top_k` | 检索到相关记忆时最多注入几条 | `5` |
 | `min_score` | 记忆召回的最低相关分，低于此分不注入 | `2` |
