@@ -162,6 +162,29 @@ def _is_temp_recall(content: str, user_name: str = "") -> bool:
     return "旧档" in (user_name or "")
 
 
+def _looks_like_roster(content: str) -> bool:
+    """像不像整理 prompt 开头那张【群成员QQ对照】表（不是要点，别当记忆存）。
+
+    为什么需要它：模型偶尔会把那张对照表**原样当成一条要点回吐**。线上实测有 8 行这样的
+    "记忆"（`【群成员QQ对照】甲=10001；乙=10002…`），除了"昵称=QQ"没有任何信息，
+    被召回时还白占注入额度。这里挡掉两种：带表头的，以及整条全是 `昵称=数字` 映射的。
+    """
+    t = (content or "").strip()
+    if not t:
+        return False
+    # 带表头的：表头后面还得真有「昵称=数字」配对，否则「【群成员QQ对照】是什么？」这种
+    # 只是提到了这句话的普通要点会被误伤
+    if t.startswith("【群成员QQ对照】"):
+        if re.search(r"[^=：:；;\s]{1,30}[=：:]\d{4,12}", t[len("【群成员QQ对照】"):]):
+            return True
+    # 整条都是「昵称=纯数字」映射（≥3 对才算，避免误伤「预算=1700」这种正常单键记忆）
+    parts = [p.strip() for p in re.split(r"[；;\n,，|]", t) if p.strip()]
+    if len(parts) < 3:
+        return False
+    pairs = [p for p in parts if re.fullmatch(r"[^=：:]{1,30}[=：:]\d{4,12}", p)]
+    return len(pairs) == len(parts)
+
+
 def _sorted_pairs(d):
     """稳定排序（键升序），让合并结果在多次迁移间可复现。"""
     return sorted(d.items(), key=lambda kv: kv[0])
@@ -435,7 +458,45 @@ class SmartMemory(Star):
                 self.config.get("profile_inject_mode", "self"),
             )
         )
+        # 整库召回的状态也落一行：出问题时一眼能看出"老记忆召回"有没有在生效
+        self._log(
+            "[{0}] 整库召回: {1}；全文索引: {2}（按时间扫 {3} 行）".format(
+                self._log_tag(),
+                "开" if self.config.get("search_extra_recall", True) else "关（老记忆可能召不回）",
+                "可用" if self.FTS_ENABLED else "不可用（退化为只扫窗口）",
+                self._scan_limit(),
+            )
+        )
+        _emb = self._providers("embedding")
+        _rrk = self._providers("rerank")
+        _name = lambda p: (getattr(getattr(p, "meta", lambda: None)(), "id", None) or "未命名") if p else None
+        _mode = self._semantic_mode()
+        if _mode == "off":
+            _sem = "off（未启用，只用文字召回）"
+        elif _emb is None:
+            _sem = (f"{_mode} 但**没找到嵌入模型** → 实际不会生效"
+                    "（请在 AstrBot 里加一个嵌入提供商，或把本项设为 off）")
+        else:
+            _sem = f"{_mode}（嵌入 {_name(_emb)}；重排 {_name(_rrk) or '未配置，用余弦排序'}）"
+        self._log(f"[{self._log_tag()}] 语义召回: {_sem}")
         self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
+
+    async def initialize(self):
+        """框架在插件加载后调用：把"补向量"这类后台活儿挂起来（不阻塞加载）。
+
+        只补「要点提取」的向量（画像走另一条注入路径）。分批、可中断、可续跑，
+        两个实例同时跑也只会有一个真的在调接口（占位表挂在 context 上）。
+        """
+        if self._semantic_mode() == "off" or not self._vec_ok():
+            return
+        try:
+            names = [n for n in os.listdir(self.db_dir)
+                     if re.fullmatch(r"memory_[0-9A-Za-z_-]+\.db", n)]
+        except Exception:
+            return
+        for n in names:
+            sid = n[len("memory_"):-len(".db")]
+            asyncio.create_task(self._embed_pending(sid))
 
     async def terminate(self):
         """插件被卸载 / 重载时由框架调用（必须定义在本类里，框架用 __dict__ 判断）。
@@ -502,6 +563,89 @@ class SmartMemory(Star):
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_short_group ON short_term(group_id)")
+        # 语义召回用的向量表（可选功能：没配嵌入模型时它一直是空的，不影响其它逻辑）
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS long_term_vec (
+                id INTEGER PRIMARY KEY,
+                dim INTEGER DEFAULT 0,
+                model TEXT DEFAULT '',
+                vec BLOB
+            )
+            """
+        )
+        # ★ 全文检索索引（最后建）：见 _init_fts 的说明
+        cls._init_fts(conn)
+
+    # 全文索引是否可用（某个库建失败就整个进程退回"只扫最近 N 行"，不再重试）
+    FTS_ENABLED: bool = True
+
+    @classmethod
+    def _init_fts(cls, conn) -> None:
+        """建全文索引：FTS5 + trigram 分词，让**整库**都能按字/4-gram 召回。
+
+        为什么需要它：`_search_long` 原来只取「最近 SEARCH_SCAN_LIMIT 行」再在 Python 里打分，
+        于是更老的记忆**静默失效**——实测某群 3731 行、每天 +62 条，约 20 天就撞上限；
+        灌到 2 万行的副本上验证过：一条 200 天前的记忆，上限 5000/20000 都召不回来。
+        有了这个索引，老记忆和最近记忆走同一套匹配（索引查询实测 0.1~0.3ms）。
+
+        用**外部内容表 + 触发器**：写入路径一行都不用改，增删改自动同步。
+        建不出来的环境（老 SQLite / 未编 FTS5）只是退回旧行为，不影响其它功能。
+        """
+        try:
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS long_term_fts USING fts5("
+                "content, keywords, content='long_term', content_rowid='id', tokenize='trigram')"
+            )
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS long_term_fts_ai AFTER INSERT ON long_term BEGIN "
+                "INSERT INTO long_term_fts(rowid, content, keywords) "
+                "VALUES (new.id, new.content, new.keywords); END"
+            )
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS long_term_fts_ad AFTER DELETE ON long_term BEGIN "
+                "INSERT INTO long_term_fts(long_term_fts, rowid, content, keywords) "
+                "VALUES ('delete', old.id, old.content, old.keywords); END"
+            )
+            conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS long_term_fts_au AFTER UPDATE ON long_term BEGIN "
+                "INSERT INTO long_term_fts(long_term_fts, rowid, content, keywords) "
+                "VALUES ('delete', old.id, old.content, old.keywords); "
+                "INSERT INTO long_term_fts(rowid, content, keywords) "
+                "VALUES (new.id, new.content, new.keywords); END"
+            )
+            # ★ 判断"索引是否真的建好了"不能用 `COUNT(*) FROM long_term_fts`：
+            #   外部内容表的 COUNT 读的是**内容表**（永远等于 long_term 行数），
+            #   于是"索引为空就回填"这个条件永远不成立 → 索引一直是空的（实测踩到过：
+            #   线上 docsize 0 行、词表 0 条，FTS 一路等于没生效，只有触发器写入的新行进了索引）。
+            #   正确做法：看 FTS 自己的 docsize 影子表（空 = 一条都没索引），
+            #   并用 fts_meta 记一个"已建"标记，保证首次/上次没填完时补一次 rebuild。
+            conn.execute("CREATE TABLE IF NOT EXISTS fts_meta (k TEXT PRIMARY KEY, v TEXT)")
+            need = True
+            try:
+                need = conn.execute("SELECT COUNT(*) FROM long_term_fts_docsize").fetchone()[0] == 0
+            except Exception:
+                need = True
+            if not need:
+                try:
+                    need = conn.execute("SELECT COUNT(*) FROM fts_meta WHERE k='built'").fetchone()[0] == 0
+                except Exception:
+                    need = True
+            n_row = conn.execute("SELECT COUNT(*) FROM long_term").fetchone()[0]
+            if n_row and need:
+                conn.execute("INSERT INTO long_term_fts(long_term_fts) VALUES('rebuild')")
+                logger.info(
+                    f"[SmartMemory] 已为 {n_row} 条长期记忆建立全文索引（老记忆也能被召回了）"
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO fts_meta(k, v) VALUES ('built', ?)",
+                (str(int(time.time())),),
+            )
+            conn.execute("INSERT OR REPLACE INTO fts_meta(k, v) VALUES ('docs', ?)", (str(n_row),))
+            cls.FTS_ENABLED = True
+        except Exception as e:
+            cls.FTS_ENABLED = False
+            logger.warning(f"[SmartMemory] 全文索引不可用，退回「只扫最近 N 行」（老记忆可能召不回）: {e}")
 
     def _ensure_db(self, self_id=None) -> str:
         """确保某 bot 的库已建表；旧版 memory.db 只迁移一次给首个 bot。"""
@@ -699,8 +843,8 @@ class SmartMemory(Star):
         if job_key in self._organizing:
             self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 正在整理中，跳过本次触发")
             return
-        # 失败退避：解析失败 / 拿不到供应商时，若不加退避，下一条消息就会再烧一次
-        # 上万字符的请求（实测一次整理 15~45 秒），群活跃时等于按条计费地空转。
+        # 失败退避：解析失败 / 拿不到供应商时，若不加退避，下一条消息就会再发一次
+        # 上万字符的请求（实测一次整理 15~45 秒），群活跃时等于按条重复空转。
         last_fail = self._organize_backoff.get(job_key, 0.0)
         if last_fail and time.time() - last_fail < self.ORGANIZE_FAIL_BACKOFF:
             return
@@ -843,19 +987,36 @@ class SmartMemory(Star):
             # 要点记忆：user_name 用中性标签（原来写的是 bot 自己的名字，
             # 注入时每条都显示「(10-11 绫地宁宁)」，模型容易以为是它自己说过的话）
             point_label = "对话记录" if str(group_id).startswith("priv_") else "群聊记录"
+            skipped_roster = 0
             for m in data.get("memories") or []:
                 content = str(m.get("content", "")).strip()
                 if not content:
+                    continue
+                # ★ 模型偶尔把 prompt 开头那张【群成员QQ对照】表当成"要点"回吐：
+                #   线上实测 8 行这样的"记忆"，除了「昵称=QQ」没有任何信息，还占注入额度。
+                if _looks_like_roster(content):
+                    skipped_roster += 1
                     continue
                 self._add_long(
                     self_id, group_id, "system", point_label, content[:200],
                     m.get("keywords") or [], "要点提取",
                 )
                 saved += 1
+            if skipped_roster:
+                self._log(
+                    f"[{self._log_tag(self_id)}] 群 {group_id} 丢掉 {skipped_roster} 条"
+                    f"「群成员QQ对照」噪音（不是要点）"
+                )
             # 清空缓冲（只删这一批，整理期间新到的消息留着下轮）
             self._clear_short(self_id, group_id, watermark)
             self._organize_backoff.pop(job_key, None)
-            self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
+            if saved:
+                self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
+                # 新写进去的记忆顺手补向量（后台，不拖慢整理收尾）
+                if self._semantic_mode() != "off" and self._vec_ok():
+                    asyncio.create_task(self._embed_pending(self_id, group_id))
+            else:
+                self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 整理完成，没新增长期记忆")
         except Exception as e:
             self._organize_backoff[job_key] = time.time()
             self._log(f"[{self._log_tag(self_id)}] AI 整理失败: {e}")
@@ -1420,16 +1581,270 @@ class SmartMemory(Star):
     # 实测成本：扫 600 行 ≈1.9ms / 3647 行 ≈15ms（单次查询，本机），所以放宽到 5000 几乎无感。
     SEARCH_SCAN_LIMIT = 5000
 
+    def _scan_limit(self) -> int:
+        """按时间扫的窗口行数（最近 N 行）。有全文索引后它只负责"最近这段时间"。"""
+        return self._cfg_int("search_scan_limit", self.SEARCH_SCAN_LIMIT, 500, 200000)
+
+    # ---------------- 语义召回（嵌入 / 重排，可选） ----------------
+    def _semantic_mode(self) -> str:
+        """off = 不用；auto = 只在文字召回不足时兜底；always = 每轮都用。
+
+        ★ 缺省是 **off**：别人的部署可能没配嵌入模型，或者配了但不想让这个插件动它
+        （用别人的额度、跑在别人的机器上，延迟与结算方式都不一样）。要用就显式打开。
+        """
+        m = str(self.config.get("semantic_recall", "off") or "off").strip().lower()
+        return m if m in ("off", "auto", "always") else "off"
+
+    def _semantic_status(self) -> str:
+        """一行话说清语义召回现在到底会不会生效（给 /mem stat 用）。"""
+        mode = self._semantic_mode()
+        if mode == "off":
+            return "off（未启用，只用文字召回）"
+        emb = self._providers("embedding")
+        if emb is None:
+            return f"{mode}，但没找到嵌入模型 → 不会生效（去 AstrBot 加一个嵌入提供商）"
+        def nm(p):
+            try:
+                return str(p.meta().id or p.meta().model or "未命名")
+            except Exception:
+                return "未命名"
+        rrk = self._providers("rerank")
+        return f"{mode}（嵌入 {nm(emb)}；重排 {nm(rrk) if rrk else '未配置 → 用余弦排序'}）"
+
+    def _providers(self, kind: str):
+        """取可用的嵌入 / 重排 Provider（AstrBot 里配置的那些）。
+
+        kind='embedding' → BGE-M3 这类；kind='rerank' → Qwen3-Reranker 这类。
+        取不到就返回 None（调用方优雅退化，绝不影响主流程）。
+        """
+        want = str(self.config.get(kind + "_provider_id", "") or "").strip()
+        try:
+            pm = self.context.provider_manager
+            insts = list(getattr(pm, kind + "_provider_insts", None) or [])
+        except Exception:
+            return None
+        if not insts:
+            return None
+        if want:
+            for p in insts:
+                try:
+                    if p.meta().id == want or p.meta().model == want:
+                        return p
+                except Exception:
+                    continue
+        return insts[0]
+
+    async def _embed_texts(self, texts: list) -> list:
+        """调嵌入模型拿向量；失败返回 []（调用方跳过本轮语义）。"""
+        if not texts:
+            return []
+        prov = self._providers("embedding")
+        if prov is None:
+            return []
+        try:
+            if hasattr(prov, "get_embeddings"):
+                return list(await prov.get_embeddings(list(texts)))
+            return [list(await prov.get_embedding(t)) for t in texts]
+        except Exception as e:
+            logger.debug("[SmartMemory] 嵌入失败: %s", e)
+            return []
+
+    def _vec_ok(self) -> bool:
+        try:
+            import numpy  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _vec_pack(vec) -> bytes:
+        import numpy as np
+        return np.asarray(vec, dtype="float16").tobytes()
+
+    @staticmethod
+    def _vec_unpack(blob) -> "object":
+        import numpy as np
+        return np.frombuffer(blob, dtype="float16").astype("float32")
+
+    def _vec_cache(self) -> dict:
+        """把某个库/作用域的向量矩阵缓存在内存里（避免每轮都从库里读 BLOB 解析）。
+
+        键 (db_path, scope) → (行数, ids, 矩阵)；行数变了就重建。
+        """
+        cache = getattr(self, "_vec_mem", None)
+        if cache is None:
+            cache = {}
+            self._vec_mem = cache
+        return cache
+
+    def _vec_matrix(self, conn, self_id: str, scope: str):
+        """返回 (ids, 矩阵) —— 该作用域已建向量的记忆；没有就返回 (None, None)。"""
+        if not self._vec_ok():
+            return None, None
+        try:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM long_term_vec v JOIN long_term l ON l.id = v.id "
+                "WHERE l.group_id = ?", (scope,)
+            ).fetchone()[0]
+        except Exception:
+            return None, None
+        if not n:
+            return None, None
+        key = (self._db_path(self_id), scope)
+        c = self._vec_cache().get(key)
+        if c and c[0] == n:
+            return c[1], c[2]
+        try:
+            import numpy as np
+            rows = conn.execute(
+                "SELECT v.id, v.vec FROM long_term_vec v JOIN long_term l ON l.id = v.id "
+                "WHERE l.group_id = ?", (scope,)
+            ).fetchall()
+            ids = [r[0] for r in rows]
+            mat = np.vstack([self._vec_unpack(r[1]) for r in rows]).astype("float32")
+            self._vec_cache()[key] = (n, ids, mat)
+            return ids, mat
+        except Exception as e:
+            logger.debug("[SmartMemory] 读取向量失败: %s", e)
+            return None, None
+
+    async def _embed_pending(self, self_id: str, scope: str = None, limit: int = 3000):
+        """给还没向量的长期记忆补向量（后台跑、分批、可中断续跑）。
+
+        向量只给「要点提取」建（画像走的是另一条注入路径），省一半开销。
+        """
+        if self._semantic_mode() == "off" or not self._vec_ok():
+            return 0
+        reg = self._organize_claims()          # 复用跨实例占位表，避免两个实例一起烧接口
+        key = "embed:%s:%s" % (self_id, scope or "*")
+        if reg.get(key) and not self._claim_is_mine(reg, key, id(self)):
+            return 0
+        reg[key] = (time.time(), id(self))
+        done = 0
+        try:
+            prov = self._providers("embedding")
+            if prov is None:
+                return 0
+            model = ""
+            try:
+                model = str(prov.meta().model or "")
+            except Exception:
+                pass
+            while True:
+                with closing(self._connect(self._db_path(self_id))) as conn:
+                    sql = ("SELECT l.id, l.content FROM long_term l "
+                           "LEFT JOIN long_term_vec v ON v.id = l.id "
+                           "WHERE v.id IS NULL AND l.raw = '要点提取' AND length(l.content) >= 6")
+                    args = []
+                    if scope:
+                        sql += " AND l.group_id = ?"
+                        args.append(scope)
+                    sql += " ORDER BY l.id DESC LIMIT ?"
+                    args.append(min(limit, 256))
+                    todo = conn.execute(sql, args).fetchall()
+                    if not todo:
+                        break
+                    vecs = await self._embed_texts([r[1] for r in todo])
+                    if not vecs or len(vecs) != len(todo):
+                        break
+                    with conn:
+                        for r, v in zip(todo, vecs):
+                            conn.execute(
+                                "INSERT OR REPLACE INTO long_term_vec (id, dim, model, vec) "
+                                "VALUES (?,?,?,?)",
+                                (r[0], len(v), model, self._vec_pack(v)),
+                            )
+                    done += len(todo)
+                    self._vec_cache().clear()   # 有新向量了，矩阵缓存作废
+                    if len(todo) < min(limit, 256):
+                        break
+        except Exception as e:
+            logger.debug("[SmartMemory] 补向量中断: %s", e)
+        finally:
+            if self._claim_is_mine(reg, key, id(self)):
+                reg.pop(key, None)
+            if done:
+                self._log(f"[{self._log_tag(self_id)}] 已为 {done} 条长期记忆建立向量")
+        return done
+
+    def _fts_rows(self, conn, group_id: str, query: str, limit: int = 1500):
+        """全文索引候选：按查询的 4-gram 在**整库**里找（老记忆的召回路径）。
+
+        索引不可用、或查询太短凑不出 4-gram 时返回空列表，调用方自然退回"最近 N 行"。
+        """
+        if not self.FTS_ENABLED:
+            return []
+        # trigram 分词只认 ≥3 字，所以 3-gram、4-gram 都拿去查：
+        # 只用 4-gram 的话，三字昵称这类词既凑不出 4-gram、也未必写在关键词里，就会漏。
+        grams = sorted(self._grams(query, 3) | self._grams(query, 4)
+                       | self._grams(_norm(query), 3) | self._grams(_norm(query), 4))
+        expr = " OR ".join('"' + g.replace('"', '""') + '"' for g in grams[:30] if g)
+        if not expr:
+            return []
+        try:
+            return conn.execute(
+                "SELECT l.* FROM long_term_fts JOIN long_term l ON l.id = long_term_fts.rowid "
+                "WHERE long_term_fts MATCH ? AND l.group_id = ? LIMIT ?",
+                (expr, group_id, limit),
+            ).fetchall()
+        except Exception as e:
+            logger.debug("[SmartMemory] 全文检索失败，本次只按时间扫: %s", e)
+            return []
+
+    def _kw_prefilter(self, conn, group_id: str, query: str, limit: int = 1500):
+        """整库里按「二字组合」查 keywords 列（老记忆的第三条候选来源）。
+
+        为什么需要：全文索引是 trigram 分词，只认**三字及以上**的子串，而中文里
+        「钥匙」「拉面」「课表」这种两字关键词极常见；打分逻辑本来就有「关键词出现在
+        提问里 → +2」，但候选集以前只取最近 N 行，老记忆根本进不来。
+        实测（2 万行作用域）：8~10 个二字条件 ≈ 17~21ms，靠「钥匙」精准捞出那条老记忆。
+        """
+        toks, seen = [], set()
+        for s in (query or "", _norm(query)):
+            t = re.sub(r"\s+", "", s)
+            for i in range(max(0, len(t) - 1)):
+                g = t[i:i + 2]
+                if len(g) == 2 and g not in seen:
+                    seen.add(g)
+                    toks.append(g)
+        toks = toks[:10]
+        if not toks:
+            return []
+        where = " OR ".join(["keywords LIKE ? ESCAPE '\\'"] * len(toks))
+        params = [group_id] + [f"%{_like_escape(t)}%" for t in toks] + [limit]
+        try:
+            return conn.execute(
+                "SELECT * FROM long_term WHERE group_id = ? AND (%s) "
+                "ORDER BY created_at DESC LIMIT ?" % where,
+                params,
+            ).fetchall()
+        except Exception as e:
+            logger.debug("[SmartMemory] 关键词预筛失败: %s", e)
+            return []
+
     def _search_long(self, self_id: str, group_id: str, query: str, top_k: int = 5):
         query = (query or "").strip()
         q_norm = _norm(query)
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
-                rows = conn.execute(
+                cands: dict = {}
+                for r in conn.execute(
                     "SELECT * FROM long_term WHERE group_id = ? "
                     "ORDER BY created_at DESC LIMIT ?",
-                    (group_id, self.SEARCH_SCAN_LIMIT),
-                ).fetchall()
+                    (group_id, self._scan_limit()),
+                ):
+                    cands[r["id"]] = r
+                # ★ 再把**整库**里命中的行并进来（按 id 去重）。以前只有上面那"最近 N 行"，
+                #   超出窗口的老记忆永远不会被召回（静默丢记忆）。两路互补：
+                #   ① 全文索引：三字及以上的模糊（4-gram）命中
+                #   ② keywords 二字预筛：中文短词（钥匙/拉面/课表）精确命中
+                #   关掉 search_extra_recall 就退回旧行为（只扫最近 N 行，更省一点开销）。
+                if bool(self.config.get("search_extra_recall", True)):
+                    for r in self._fts_rows(conn, group_id, query):
+                        cands.setdefault(r["id"], r)
+                    for r in self._kw_prefilter(conn, group_id, query):
+                        cands.setdefault(r["id"], r)
+                rows = list(cands.values())
         except Exception as e:
             logger.warning(f"[SmartMemory] 检索失败: {e}")
             return []
@@ -1581,6 +1996,14 @@ class SmartMemory(Star):
             val = default
         return max(lo, min(hi, val))
 
+    def _cfg_float(self, key: str, default: float, lo: float, hi: float) -> float:
+        """读一个浮点配置并夹到 [lo, hi]，坏值回退默认。"""
+        try:
+            val = float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            val = default
+        return max(lo, min(hi, val))
+
     def _profile_for_inject(self, row, cap: int) -> str:
         """把一条画像行整理成注入用的短文本。
 
@@ -1631,6 +2054,114 @@ class SmartMemory(Star):
         except Exception:
             return []
 
+    # ---------------- 语义候选（嵌入 + 余弦 + 重排） ----------------
+    @staticmethod
+    def _semantic_ok_query(query: str) -> bool:
+        """查询太碎就不做语义召回。
+
+        实测：「？？？？？？？」这类纯标点，向量照样会捞出一条毫不相关的记忆
+        （余弦 0.465、重排 0.03），纯属噪音。这里要求去掉标点后至少 4 个字符。
+        """
+        core = re.sub(r"[\s\W_]+", "", query or "")
+        return len(core) >= 4
+
+    async def _semantic_candidates(self, self_id: str, group_id: str, query: str):
+        """语义召回：查询向量 × 记忆向量 → 余弦前 N → 三道闸 → （可选）重排。
+
+        返回 [(row, 余弦, 重排分)]，按相关性降序；任何一步不可用都返回 []（不影响主流程）。
+        """
+        if not self._vec_ok() or not self._semantic_ok_query(query):
+            return []
+        # ★ 两条远程调用都要有超时上限：实测重排最慢一次 2.2 秒、嵌入 0.7 秒，
+        #   不设上限时"偶尔的网络抖动"会把回复拖住好几秒（超时就退回上一步的结果）。
+        emb_to = self._cfg_float("semantic_embed_timeout", 5.0, 0.5, 30.0)
+        try:
+            qv = await asyncio.wait_for(self._embed_texts([query]), timeout=emb_to)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.debug("[SmartMemory] 语义召回：嵌入超时/失败（%s），本轮跳过", e)
+            return []
+        if not qv:
+            return []
+        try:
+            import numpy as np
+            with closing(self._connect(self._db_path(self_id))) as conn:
+                ids, mat = self._vec_matrix(conn, self_id, group_id)
+                if ids is None:
+                    return []
+                q = np.asarray(qv[0], dtype="float32")
+                q = q / (np.linalg.norm(q) + 1e-9)
+                norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
+                sims = (mat / norms) @ q
+                n = self._cfg_int("semantic_top_n", 8, 1, 50)
+                order = np.argsort(-sims)[:n]
+                cos_floor = float(self.config.get("semantic_min_cos", 0.5) or 0.0)
+                picks = [(ids[int(i)], float(sims[int(i)])) for i in order
+                         if float(sims[int(i)]) >= cos_floor]
+                if not picks:
+                    return []
+                placeholders = ",".join("?" * len(picks))
+                found = {r["id"]: r for r in conn.execute(
+                    "SELECT * FROM long_term WHERE id IN (%s)" % placeholders,
+                    [p[0] for p in picks])}
+            cand = [(found[i], c) for i, c in picks if i in found]
+        except Exception as e:
+            logger.debug("[SmartMemory] 语义召回失败: %s", e)
+            return []
+        # 重排：判别力比余弦强得多（实测相关 0.05~0.99 vs 无关 0.0008），有就用
+        prov = self._providers("rerank")
+        if prov is not None and len(cand) > 1:
+            try:
+                rrk_to = self._cfg_float("semantic_rerank_timeout", 3.0, 0.5, 30.0)
+                res = await asyncio.wait_for(
+                    prov.rerank(query, [r["content"] or "" for r, _c in cand], top_n=len(cand)),
+                    timeout=rrk_to,
+                )
+                out = []
+                for it in res or []:
+                    i = int(getattr(it, "index", -1))
+                    s = float(getattr(it, "relevance_score", 0.0) or 0.0)
+                    if 0 <= i < len(cand):
+                        out.append((cand[i][0], cand[i][1], s))
+                if out:
+                    floor = float(self.config.get("semantic_min_rerank", 0.05) or 0.0)
+                    kept = [x for x in out if x[2] >= floor]
+                    logger.debug("[SmartMemory] 语义候选 %d 条，重排后留下 %d 条（闸 %.3f）",
+                                 len(cand), len(kept), floor)
+                    return kept
+            except Exception as e:
+                logger.debug("[SmartMemory] 重排失败，退回余弦排序: %s", e)
+        # 没有重排模型时，余弦门槛提高一点（避免硬塞不相关的旧事）
+        return [(r, c, 0.0) for r, c in cand if c >= max(0.62, 0.0)]
+
+    async def _search_long_async(self, self_id: str, group_id: str, query: str, top_k: int = 5):
+        """文字召回 +（按需）语义召回 +（可选）重排。
+
+        - `semantic_recall=off`：完全等于原来的 `_search_long`
+        - `auto`（默认）：文字召回到东西就原样返回（**不加任何延迟**）；一条都没召回到时，
+          才走语义兜底（一次嵌入 + 一次重排，约 0.8 秒）。实测触发率约 8%
+        - `always`：每轮都把语义候选并进来（召回最全，但每轮多约 0.8 秒）
+        """
+        mems = self._search_long(self_id, group_id, query, top_k)
+        mode = self._semantic_mode()
+        if mode == "off":
+            return mems
+        if mode == "auto" and mems:
+            return mems
+        try:
+            extra = await self._semantic_candidates(self_id, group_id, query)
+        except Exception as e:
+            logger.debug("[SmartMemory] 语义兜底异常: %s", e)
+            extra = []
+        if not extra:
+            return mems
+        seen = {r["id"] for r in mems}
+        merged = list(mems) + [r for r, _c, _s in extra if r["id"] not in seen]
+        # 有重排分时按重排分定先后（跨"文字候选"与"语义候选"统一排序）
+        scored = {r["id"]: s for r, _c, s in extra if s}
+        if scored and bool(self.config.get("rerank_enabled", True)):
+            merged.sort(key=lambda r: -scored.get(r["id"], 0.0))
+        return merged[:top_k]
+
     # ---------------- 注入上下文 ----------------
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -1646,7 +2177,7 @@ class SmartMemory(Star):
             parts = []
             # 相关长期记忆
             top_k = int(self.config.get("top_k", 5))
-            mems = self._search_long(self_id, group_id, query, top_k)
+            mems = await self._search_long_async(self_id, group_id, query, top_k)
             if mems:
                 lines = []
                 for r in mems:
@@ -1890,8 +2421,19 @@ class SmartMemory(Star):
                         "SELECT COUNT(*) FROM short_term WHERE group_id = ? AND expire_at > ?",
                         (group_id, time.time()),
                     ).fetchone()[0]
+                    try:
+                        idx_n = conn.execute(
+                            "SELECT COUNT(*) FROM long_term_fts WHERE long_term_fts MATCH ?",
+                            ("a",),
+                        ).fetchone()[0]
+                        fts = "可用（整库都能召回）"
+                    except Exception:
+                        fts = "不可用（只扫最近 %d 行）" % self._scan_limit()
                 yield event.plain_result(
-                    f"本群记忆统计：长期 {long_n} 条，短期（保留期内）{short_n} 条"
+                    f"本群记忆统计：长期 {long_n} 条，短期（保留期内）{short_n} 条\n"
+                    f"全文索引：{fts}\n"
+                    f"整库召回：{'开' if self.config.get('search_extra_recall', True) else '关'}\n"
+                    f"语义召回：{self._semantic_status()}"
                 )
             except Exception as e:
                 yield event.plain_result(f"统计失败: {e}")

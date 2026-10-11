@@ -108,6 +108,72 @@
     "type": "int",
     "default": 120
   },
+  "search_scan_limit": {
+    "description": "长期记忆检索：按时间扫的窗口行数",
+    "hint": "只管「最近的记忆」这一路。整库的老记忆由全文索引（FTS5 + trigram）负责召回，不受这个数字限制——老记忆不会因为超出窗口就再也想不起来。窗口越大每次检索越慢（实测 5000 行 ≈ 40 毫秒，20000 行 ≈ 200 毫秒）",
+    "type": "int",
+    "default": 5000
+  },
+  "search_extra_recall": {
+    "description": "整库召回（让很久以前的记忆也能想起来）",
+    "hint": "开着：除了「最近 N 行」，还会用全文索引（FTS5）和关键词二字预筛在**整库**里找，很久以前的约定/事件也召得回来。关掉退回旧行为（只扫最近 N 行，每次省约 20~60 毫秒，但超出窗口的老记忆就再也想不起来了）",
+    "type": "bool",
+    "default": true
+  },
+  "semantic_recall": {
+    "description": "语义召回（用 AstrBot 里配的嵌入模型：换种说法也能想起来）",
+    "hint": "默认 off —— **要用就显式打开**（别人可能没配嵌入模型，或者不想让这个插件动它）。off：只用文字召回（全文索引 + 关键词）；auto：只在「文字一条都没召回到」时才走语义兜底，常规轮不加延迟；always：每轮都做语义召回 + 重排。auto/always 需要 AstrBot 里已配置嵌入模型（云 API、本地 Ollama/vLLM 都行，只要是嵌入提供商）；首次开启会给已有记忆补向量（后台分批跑，不阻塞加载）。延迟取决于你自己的模型跑在哪：本地通常远快于云 API",
+    "type": "string",
+    "default": "off"
+  },
+  "semantic_top_n": {
+    "description": "语义召回取前几条",
+    "hint": "按余弦相似度取前 N 条作为候选，再和文字召回的候选一起重排/打分。取大一点召回更全、重排更慢",
+    "type": "int",
+    "default": 8
+  },
+  "semantic_min_cos": {
+    "description": "语义召回的余弦下限",
+    "hint": "低于这个相似度就不当候选（避免硬塞不相关的旧事）。**这个值跟模型有关**：BGE-M3 实测同一件事换说法约 0.55~0.65、无关内容 0.35~0.45，所以默认 0.5；换别的嵌入模型后如果发现「什么都召不回」就调小，发现「乱塞旧事」就调大（用 /mem stat 先确认语义召回是否生效）",
+    "type": "float",
+    "default": 0.5
+  },
+  "semantic_min_rerank": {
+    "description": "语义召回的重排分下限",
+    "hint": "重排分低于它的语义候选会被丢掉。**这个值跟重排模型有关**：Qwen3-Reranker-4B 实测相关 0.05~0.99、随机记忆平均 0.011，所以默认 0.05。只配了嵌入、没配重排时这一项不生效（改用余弦排序，门槛自动提到 0.62）",
+    "type": "float",
+    "default": 0.05
+  },
+  "semantic_embed_timeout": {
+    "description": "语义召回：嵌入调用超时（秒）",
+    "hint": "超过就本轮不做语义召回（不影响文字召回）。本地模型可以调小（如 1 秒），走云 API 建议留 5 秒",
+    "type": "float",
+    "default": 5.0
+  },
+  "semantic_rerank_timeout": {
+    "description": "语义召回：重排调用超时（秒）",
+    "hint": "超过就改用余弦相似度排序（仍会注入，只是先后顺序差一点）。本地模型可以调到 1~1.5 秒更跟手；云 API 实测 0.4~2.2 秒，默认 3 秒",
+    "type": "float",
+    "default": 3.0
+  },
+  "rerank_enabled": {
+    "description": "用重排模型给候选重新排序",
+    "hint": "开着：候选多于注入条数时，交给重排模型（如 Qwen3-Reranker）定先后，最相关的排前面。实测判别力很强（相关 0.05 vs 无关 0.0008）。关掉则只按关键词/字面分数排",
+    "type": "bool",
+    "default": true
+  },
+  "embedding_provider_id": {
+    "description": "指定嵌入模型（留空=自动用第一个可用的）",
+    "hint": "填 AstrBot 提供商列表里的名字，例如 BGE-M3。留空则用列表里第一个嵌入模型",
+    "type": "string",
+    "default": ""
+  },
+  "rerank_provider_id": {
+    "description": "指定重排模型（留空=自动用第一个可用的）",
+    "hint": "填 AstrBot 提供商列表里的名字，例如 Qwen3-Reranker-4B。留空则用列表里第一个重排模型",
+    "type": "string",
+    "default": ""
+  },
   "profile_dynamic_ttl_days": {
     "description": "动态条目的注入保质期（天）",
     "hint": "近期情绪/近期感受/事件/预算这类会过期的键，超过这么多天就不再注入（只在注入时过滤，不删库）。填 0 关闭时效过滤",
