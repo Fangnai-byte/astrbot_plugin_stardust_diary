@@ -134,6 +134,29 @@ def _resolve_qq(name: str, nick2qq: dict) -> str:
     return cands.pop() if len(cands) == 1 else ""
 
 
+# 消息在说「说话人自己」时才值得带上他的画像（省 token）：
+#   「锐评一下我」「我是谁」「我的事」「你们觉得我呢」
+# 注意：「锐评」单独出现（如群里那句「宁宁求锐评」）也是"在问我"——实测没这条规则时
+# 它没被认成自指问题，于是画像只有 80 字、模型只能泛泛回一句"话太少了"。
+_SELF_RE = re.compile(
+    r"(?:锐评|点评|评价)"
+    r"|(?:说说|讲讲|聊聊|了解|认识|记得|记住|想起|知道|感觉|觉得|看|猜|分析|形容|描述)"
+    r"[一下下]{0,2}(?:我|咱|本人)"
+    r"|(?:我|咱|本人)(?:呢|吗|嘛|的(?:事|名字|情况|画像|档案|习惯|喜好)|是(?:谁|什么)|平时|最近|怎么样|如何)"
+    r"|(?:你|您|你们|大伙|各位|大家)(?:觉得|看|认为|说说|评价|认识)[一下]{0,2}(?:我|咱|本人)"
+)
+
+
+def _like_escape(s: str) -> str:
+    """把 LIKE 里的通配符转义掉（配合 `ESCAPE '\\'`）。
+
+    坑：昵称是用户可控的，而 SQLite 的 LIKE 里 `%`/`_` 是通配符。
+    实测昵称传 `%` 时 `user_name LIKE '%%%'` 会匹配**所有**画像行，
+    于是别人的档案会被当成"说话人本人"注入（`feng_king` 这种带下划线的昵称一样中招）。
+    """
+    return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _is_temp_recall(content: str, user_name: str = "") -> bool:
     """时效性内容（有人设保质期的「旧档」画像）不参与普通关键词召回。"""
     return "旧档" in (user_name or "")
@@ -284,25 +307,61 @@ def _profile_key_priority(key: str) -> int:
 
 
 def _profile_drop_dynamic(
-    d: dict, created_at: float | None, ttl_days: int
+    d: dict, created_at: float | None, ttl_days: int, kv_ts: dict | None = None
 ) -> tuple[dict, list[str]]:
     """按 TTL 去掉过期的动态键。返回 (保留的字典, 被去掉的键名列表)。
 
-    画像行的 created_at 只在内容被更新（合并/归一）时刷新，所以它是"这条画像
-    最近一次被改"的可靠时间锚点；ttl_days <= 0 表示不做时效过滤。
+    ★ 时效锚点用**每个键自己的时间戳**（`kv_ts`，见 `long_term.kv_ts` 列）：
+    以前只看整行的 created_at，而合并时它会被刷成 now，于是只要这个人还在被整理，
+    「近期情绪」这类动态键**永远不会过期**（值可能是几周前的还当"近期"注入）。
+    `kv_ts` 里没有的键（老数据）退回用 created_at，行为与旧版一致。
+    ttl_days <= 0 表示不做时效过滤。
     """
-    if not ttl_days or ttl_days <= 0 or not created_at:
+    if not ttl_days or ttl_days <= 0:
         return d, []
-    age_days = (time.time() - float(created_at)) / 86400.0
-    if age_days <= ttl_days:
-        return d, []
+    kv_ts = kv_ts or {}
+    now = time.time()
     kept, dropped = {}, []
     for k, v in d.items():
-        if k in PROFILE_DYNAMIC_KEYS:
+        if k not in PROFILE_DYNAMIC_KEYS:
+            kept[k] = v
+            continue
+        ts = kv_ts.get(k)
+        try:
+            ts = float(ts) if ts else (float(created_at) if created_at else None)
+        except (TypeError, ValueError):
+            ts = float(created_at) if created_at else None
+        if ts and (now - ts) / 86400.0 > ttl_days:
             dropped.append(k)
         else:
             kept[k] = v
-    return (kept or d), dropped
+    # 注意：这里**不做** `kept or d` 的兜底。以前"全被丢光就整条留下"，
+    # 于是只剩一条过期动态键的画像（例如只有「近期情绪=三周前」）会被整条注入，
+    # 反而把当轮语境带偏。调用方（_profile_for_inject）会在结果为空时返回空串，
+    # 由 on_llm_req 跳过——宁可这一轮不带画像，也别塞一条过期情绪。
+    return kept, dropped
+
+
+def _kv_ts_load(raw) -> dict:
+    """把 `kv_ts` 列的 JSON 解析成 {键: 时间戳}；坏数据当空。"""
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return {str(k): v for k, v in d.items()} if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _kv_ts_dump(d: dict) -> str:
+    """序列化 {键: 时间戳}；只留能转成数字的值，避免脏数据进库。"""
+    out = {}
+    for k, v in (d or {}).items():
+        try:
+            out[str(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return json.dumps(out, ensure_ascii=False) if out else ""
 
 
 def _pack_profile(
@@ -312,6 +371,7 @@ def _pack_profile(
     max_chars: int,
     created_at: float | None = None,
     ttl_days: int = 0,
+    kv_ts: dict | None = None,
 ) -> str:
     """把键值字典打包成一行画像。
 
@@ -320,7 +380,7 @@ def _pack_profile(
     """
     work = dict(d or {})
     if ttl_days:
-        work, _dropped = _profile_drop_dynamic(work, created_at, ttl_days)
+        work, _dropped = _profile_drop_dynamic(work, created_at, ttl_days, kv_ts)
     items = sorted(work.items(), key=lambda kv: (-_profile_key_priority(kv[0]), kv[0]))
     if len(items) > max_keys:
         items = items[:max_keys]
@@ -361,7 +421,7 @@ class SmartMemory(Star):
         # 把"省 token 的当前策略"落到日志里，出问题时一眼能看出配置有没有生效
         self._log(
             "[{0}] 缓冲策略: record_scope={1}、min_msg_chars={2}、禁用作用域={3}、"
-            "单次整理上限={4}字；注入 top_k={5}、画像≤{6}字、兜底画像={7}".format(
+            "单次整理上限={4}字；注入 top_k={5}、画像≤{6}字、本人画像注入={7}".format(
                 self._log_tag(),
                 self.config.get("record_scope", "all"),
                 self.config.get("min_msg_chars", 0),
@@ -369,7 +429,7 @@ class SmartMemory(Star):
                 self.config.get("organize_max_chars", 12000),
                 self.config.get("top_k", 5),
                 self.config.get("profile_max_chars", 120),
-                self.config.get("profile_fallback", True),
+                self.config.get("profile_inject_mode", "self"),
             )
         )
         self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
@@ -397,11 +457,20 @@ class SmartMemory(Star):
                 content TEXT NOT NULL,
                 keywords TEXT DEFAULT '',
                 raw TEXT DEFAULT '',
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                kv_ts TEXT DEFAULT ''
             )
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_long_group ON long_term(group_id)")
+        # 老库升级：补 kv_ts 列（每个画像键"最后一次被更新"的时间戳，JSON）
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(long_term)")}
+            if "kv_ts" not in cols:
+                conn.execute("ALTER TABLE long_term ADD COLUMN kv_ts TEXT DEFAULT ''")
+                logger.info("[SmartMemory] 已为 long_term 补上 kv_ts 列（画像键级时效）")
+        except Exception as e:
+            logger.warning(f"[SmartMemory] 补 kv_ts 列失败（不影响其它功能）: {e}")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS short_term (
@@ -509,6 +578,10 @@ class SmartMemory(Star):
         if str(group_id) in {str(x).strip() for x in scopes}:
             return "该作用域在 disabled_scopes 里"
 
+        # ★ 私聊不做「唤醒」和「长度」两道过滤：
+        #   私聊每条都是对着 bot 说的（不存在"没叫它"），而且「嗯」「好」「晚安」
+        #   这类短句恰恰是语境的一部分；水消息问题只存在于群聊。
+        is_private = str(group_id).startswith("priv_")
         mode = str(self.config.get("record_scope", "all") or "all").strip().lower()
         is_bot = str(event.get_sender_id()) == str(event.get_self_id())
         if mode == "bot":
@@ -516,7 +589,7 @@ class SmartMemory(Star):
                 return "record_scope=bot（只记 bot 自己的发言）"
         elif is_bot:
             return "bot 自己的发言（避免自我循环）"
-        elif mode == "triggered":
+        elif mode == "triggered" and not is_private:
             # 「被唤醒/被回复到」的消息才记：开销随 bot 活跃度走，而不是随群活跃度
             try:
                 woke = bool(getattr(event, "is_at_or_wake_command", False)) or bool(event.is_wake_up())
@@ -529,7 +602,7 @@ class SmartMemory(Star):
             min_chars = int(self.config.get("min_msg_chars", 0) or 0)
         except (TypeError, ValueError):
             min_chars = 0
-        if min_chars and len(text) < min_chars:
+        if min_chars and not is_private and len(text) < min_chars:
             return f"短于 min_msg_chars={min_chars}"
         return None
 
@@ -597,18 +670,37 @@ class SmartMemory(Star):
             #   而正文才 16.6 字）。现在改成开头放一张【群成员QQ对照】表，正文只留
             #   「昵称: 内容」。认人本来就用 buffer 里的 昵称→QQ 映射（_resolve_qq），
             #   不依赖 prompt 里逐条带 QQ；画像的 QQ 锚点也由 _merge_profile 自己写。
-            speakers, seen_qq = [], set()
+            cap = max(1000, max_chars)
+            # ★ 只把「真的装进 prompt 的那些行」算作已处理：
+            #   body 会被 cap 截断，若水位线仍取整批的最大 id，被截掉的消息就
+            #   **从没进过模型却被删了**（调小 organize_max_chars 时特别容易踩）。
+            #   这里逐行累加，记下最后一行装进去的 id 当水位线，剩下的留在缓冲里下轮再处理。
+            picked, used, last_id = [], 0, 0
             for r in msgs:
+                line = f"{(r['user_name'] or '').strip() or r['user_id']}: {r['content']}"
+                if used + len(line) + 1 > cap - 400 and picked:   # 留 400 字给开头的对照表
+                    break
+                picked.append((r, line))
+                used += len(line) + 1
+                last_id = int(r["id"])
+            speakers, seen_qq = [], set()
+            for r, _line in picked:
                 u = str(r["user_id"] or "")
                 n = (r["user_name"] or "").strip() or u
                 if u and u != "system" and u not in seen_qq:
                     seen_qq.add(u)
                     speakers.append((n, u))
             roster = "；".join(f"{n}={u}" for n, u in speakers[:80])
-            body = "\n".join(
-                f"{(r['user_name'] or '').strip() or r['user_id']}: {r['content']}" for r in msgs
+            text = ("【群成员QQ对照】" + roster + "\n\n"
+                    + "\n".join(line for _r, line in picked))[:cap]
+            if last_id:
+                watermark = last_id
+            else:                      # 一行都装不下就宁可不删
+                watermark = 0
+            self._log(
+                f"[{self._log_tag(self_id)}] 本次整理喂入 {len(picked)}/{len(msgs)} 条"
+                f"（{len(text)} 字），水位线 id={watermark}"
             )
-            text = ("【群成员QQ对照】" + roster + "\n\n" + body)[:max(1000, max_chars)]
             provider = self._pick_provider()
             self._log(f"[{self._log_tag(self_id)}] provider: {provider.meta().id if provider else None}")
             if provider is None:
@@ -662,12 +754,15 @@ class SmartMemory(Star):
                 self._merge_profile(self_id, group_id, uname, attrs, qq=qq)
                 saved += 1
             # 要点记忆
+            # 要点记忆：user_name 用中性标签（原来写的是 bot 自己的名字，
+            # 注入时每条都显示「(10-11 绫地宁宁)」，模型容易以为是它自己说过的话）
+            point_label = "对话记录" if str(group_id).startswith("priv_") else "群聊记录"
             for m in data.get("memories") or []:
                 content = str(m.get("content", "")).strip()
                 if not content:
                     continue
                 self._add_long(
-                    self_id, group_id, "system", self._log_tag(self_id), content[:200],
+                    self_id, group_id, "system", point_label, content[:200],
                     m.get("keywords") or [], "要点提取",
                 )
                 saved += 1
@@ -958,7 +1053,9 @@ class SmartMemory(Star):
     @classmethod
     def _profile_key(cls, uname: str) -> str:
         """'昵称(1234567890)' → '昵称'（去掉尾部括号备注，避免同一人开两份档案）。"""
-        n = (uname or "").strip()
+        # 顺手把空白（含模型偶尔写进来的换行）压成单个空格：
+        # 实测有人的画像名里带了换行，注入时那条画像会被劈成两半
+        n = re.sub(r"\s+", " ", (uname or "")).strip()
         return (cls._PROFILE_SUFFIX_RE.sub("", n).strip() or n or "未知")
 
     @staticmethod
@@ -977,18 +1074,36 @@ class SmartMemory(Star):
                     merged[k] = v
         return merged
 
-    def _merge_identity_rows(self, conn, identity: str, rows, merged: dict | None = None) -> int:
+    def _merge_identity_rows(
+        self, conn, identity: str, rows, merged: dict | None = None,
+        kv_ts_new: dict | None = None,
+    ) -> int:
         """把同一身份的画像行合并成一行（调用方负责事务）。返回删除的行数。
 
         `merged` 是调用方已经算好的键值（行里的旧值 + 本次新提炼的），它**必须**
         参与最终写入——早期版本这里只从 `rows` 重算，导致 `_merge_profile` 里辛苦
         合进去的新键值被整个丢掉（新建的人永远是一行空壳、老人的画像永不更新）。
+
+        `kv_ts_new` 是本次新提炼的键 → 时间戳；旧的从各行的 kv_ts 列继承
+        （行按 created_at 升序传入，后者覆盖前者）。只有出现在本批里的键才刷新时间，
+        其余键的"最后一次被更新"保持原样——这正是动态键 TTL 能真正生效的前提。
         """
         work = self._rows_to_merged(rows)
         if merged:
             work.update(merged)
         if not work:
             return 0
+        kv_ts = {}
+        for r in rows:
+            try:
+                raw = r["kv_ts"]
+            except (IndexError, KeyError):
+                raw = ""
+            for k, v in _kv_ts_load(raw).items():
+                kv_ts[k] = v
+        for k, v in (kv_ts_new or {}).items():
+            kv_ts[k] = v
+        kv_ts = {k: v for k, v in kv_ts.items() if k in work}   # 顺手清掉已不在的键
         content = _pack_profile(
             identity, work, self.PROFILE_MAX_KEYS, self.PROFILE_MAX_CHARS,
             created_at=rows[-1]["created_at"] if "created_at" in rows[-1].keys() else None,
@@ -997,9 +1112,9 @@ class SmartMemory(Star):
         kws = ",".join([identity] + [k for k, _ in _sorted_pairs(work)])[:200]
         latest = rows[-1]["id"]
         conn.execute(
-            "UPDATE long_term SET user_name=?, content=?, keywords=?, created_at=? "
+            "UPDATE long_term SET user_name=?, content=?, keywords=?, created_at=?, kv_ts=? "
             "WHERE id=?",
-            (identity, content, kws, time.time(), latest),
+            (identity, content, kws, time.time(), _kv_ts_dump(kv_ts), latest),
         )
         ids = [r["id"] for r in rows if r["id"] != latest]
         if ids:
@@ -1017,7 +1132,7 @@ class SmartMemory(Star):
         """
         changed = 0
         rows = conn.execute(
-            "SELECT id, user_name, content, created_at FROM long_term "
+            "SELECT id, user_name, content, created_at, kv_ts FROM long_term "
             "WHERE group_id=? AND content LIKE '【画像】%'",
             (group_id,),
         ).fetchall()
@@ -1031,12 +1146,18 @@ class SmartMemory(Star):
                 created_at=r["created_at"],
                 ttl_days=0,  # 归一化落盘不删动态键（保留数据），只在注入前按 TTL 过滤
             )
-            if content == (r["content"] or ""):
+            # kv_ts 的键名跟着归一化后的键名走（`昵称`→`称呼` 这类改名不能丢时间戳）
+            kv_ts = {}
+            for k, v in _kv_ts_load(r["kv_ts"] if "kv_ts" in r.keys() else "").items():
+                kv_ts[_canon_key(k)] = v
+            kv_ts = {k: v for k, v in kv_ts.items() if k in merged}
+            kv_raw = _kv_ts_dump(kv_ts)
+            if content == (r["content"] or "") and kv_raw == (r["kv_ts"] or ""):
                 continue
             kws = ",".join([ident] + [k for k, _ in _sorted_pairs(merged)])[:200]
             conn.execute(
-                "UPDATE long_term SET user_name=?, content=?, keywords=? WHERE id=?",
-                (ident, content, kws, r["id"]),
+                "UPDATE long_term SET user_name=?, content=?, keywords=?, kv_ts=? WHERE id=?",
+                (ident, content, kws, kv_raw, r["id"]),
             )
             changed += 1
         if changed:
@@ -1064,7 +1185,7 @@ class SmartMemory(Star):
             with closing(self._connect(db_path)) as conn, conn:
                 self._run_canonical_pass(conn, group_id)
                 rows = conn.execute(
-                    "SELECT id, user_name, content, created_at FROM long_term "
+                    "SELECT id, user_name, content, created_at, kv_ts FROM long_term "
                     "WHERE group_id=? AND content LIKE '【画像】%' "
                     "ORDER BY created_at ASC, id ASC",
                     (group_id,),
@@ -1127,7 +1248,7 @@ class SmartMemory(Star):
         try:
             with closing(self._connect(self._db_path(self_id))) as conn, conn:
                 cands = conn.execute(
-                    "SELECT id, user_name, content, created_at FROM long_term "
+                    "SELECT id, user_name, content, created_at, kv_ts FROM long_term "
                     "WHERE group_id=? AND content LIKE '【画像】%' "
                     "ORDER BY created_at ASC, id ASC LIMIT 500",
                     (group_id,),
@@ -1143,10 +1264,14 @@ class SmartMemory(Star):
                     elif row_name == key:
                         same.append(c)          # 至少一边没有 QQ，只能按昵称认
                 merged = self._rows_to_merged(same)
+                kv_ts_new = {}
+                now_ts = time.time()
                 for k, v in attrs.items():
                     k, v = _canon_key(str(k)), str(v).strip()
                     if k and v:
                         merged[k] = v
+                        # ★ 只给本批出现的键打时间戳：动态键 TTL 靠它判断"这条还新不新"
+                        kv_ts_new[k] = now_ts
                 if not merged:
                     return False
                 rows = list(same)
@@ -1158,7 +1283,7 @@ class SmartMemory(Star):
                         (group_id, "system", key, f"【画像】{key}：", "", "人物画像", time.time()),
                     )
                     placeholder = conn.execute(
-                        "SELECT id, user_name, content, created_at FROM long_term "
+                        "SELECT id, user_name, content, created_at, kv_ts FROM long_term "
                         "WHERE group_id=? AND content=? ORDER BY id DESC LIMIT 1",
                         (group_id, f"【画像】{key}："),
                     ).fetchone()
@@ -1168,7 +1293,7 @@ class SmartMemory(Star):
                 # ★ merged 必须传进去：只传 rows 的话，本次新提炼的键值会被
                 #   _merge_identity_rows 内部的"从 rows 重算"覆盖掉（老 bug，
                 #   表现为新人画像永远是空壳、老人画像永不更新）
-                self._merge_identity_rows(conn, key, rows, merged)
+                self._merge_identity_rows(conn, key, rows, merged, kv_ts_new)
                 return True
         except Exception as e:
             logger.warning(f"[SmartMemory] 画像合并写入失败，回退为新增: {e}")
@@ -1292,15 +1417,21 @@ class SmartMemory(Star):
         name = (user_name or "").strip()
         conds, args = [], [group_id]
         if uid:
-            conds.append("content LIKE ?")
-            args.append(f"%QQ号={uid}%")
-            conds.append("content LIKE ?")
-            args.append(f"%({uid})%")
+            # ★ QQ 在正文里有好几种写法：1.6.3 起统一写 `QQ=<uid>`，老数据里可能是
+            #   `QQ号=` / 全角冒号 / `昵称(uid)`。以前只匹配后两种，于是**换了昵称的人
+            #   明明有画像也找不到**（实测：某成员画像里写着 QQ=123456789，却一条都取不出来）。
+            u = _like_escape(uid)
+            for pat in (f"%QQ={u}%", f"%QQ号={u}%", f"%QQ：{u}%",
+                        f"%QQ:{u}%", f"%({u})%"):
+                conds.append("content LIKE ? ESCAPE '\\'")
+                args.append(pat)
             conds.append("user_id = ?")
             args.append(uid)
         if name:
-            conds.append("user_name LIKE ?")
-            args.append(f"%{name}%")
+            # ★ 昵称必须转义：不转义时昵称里的 % / _ 会当通配符，
+            #   把别人的画像当成"本人"返回（实测传 '%' 会命中整个库的画像行）
+            conds.append("user_name LIKE ? ESCAPE '\\'")
+            args.append(f"%{_like_escape(name)}%")
         if not conds:
             return []
         args.append(limit)
@@ -1371,16 +1502,22 @@ class SmartMemory(Star):
         ident = _profile_identity(raw, row["user_name"] or "")
         merged = self._rows_to_merged([row])
         if not merged:
-            return _clip(raw, cap)
+            return ""          # 空壳画像（没有任何键值）没有注入价值
         ttl_days = self._cfg_int("profile_dynamic_ttl_days", 3, 0, 365)
         try:
             created_at = row["created_at"]
         except Exception:
             created_at = None
-        return _pack_profile(
+        try:
+            kv_ts = _kv_ts_load(row["kv_ts"])
+        except Exception:
+            kv_ts = {}
+        body = _pack_profile(
             ident, merged, self.PROFILE_MAX_KEYS, cap,
-            created_at=created_at, ttl_days=ttl_days,
+            created_at=created_at, ttl_days=ttl_days, kv_ts=kv_ts,
         )
+        # 动态键被 TTL 全丢光时 _pack_profile 会剩一个「【画像】甲：」的空壳，直接当没有
+        return body if "=" in body else ""
 
     def _recent_short_since(self, self_id: str, group_id: str, since_ts: float, n: int = 10):
         try:
@@ -1425,17 +1562,39 @@ class SmartMemory(Star):
                 for r in mems:
                     when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
                     lines.append(f"- ({when} {r['user_name']}) {r['content']}")
-                parts.append("【记忆片段，来自本群历史消息，可参考但勿编造】\n" + "\n".join(lines))
-            # 提问者本人档案/记忆兜底：问“你记得我吗/我平时怎样”时本人画像优先
+                scope_label = "本会话" if str(group_id).startswith("priv_") else "本群"
+                parts.append(
+                    f"【记忆片段，来自{scope_label}历史消息，可参考但勿编造】\n" + "\n".join(lines)
+                )
+            # 提问者本人档案/记忆：默认「被试及到自己 / 探询 / 没召回到东西」时带上本人画像。
+            # ★ 以前只看「探询正则 或 没召回到东西」，于是**只要召回到记忆就永远不注入画像**
+            #   （群里几乎每轮都能召回到东西 → 画像长期不出现，表现为"它好像不认识我"）。
+            mode = str(self.config.get("profile_inject_mode", "self") or "self").strip().lower()
+            if mode not in ("off", "fallback", "self", "always"):
+                mode = "self"
+            probe = bool(_PROBE_RE.search(query))
+            self_ref = bool(_SELF_RE.search(query))
+            if mode == "always":
+                want_profile = True
+            elif mode == "self":
+                want_profile = probe or self_ref or not mems
+            elif mode == "fallback":
+                want_profile = probe or (not mems and bool(self.config.get("profile_fallback", True)))
+            else:                       # off
+                want_profile = False
             uid = str(event.get_sender_id() or "")
             uname = event.get_sender_name() or uid
-            if uid and (
-                _PROBE_RE.search(query)
-                or (not mems and bool(self.config.get("profile_fallback", True)))
-            ):
+            if uid and want_profile:
                 try:
                     lim = self._cfg_int("profile_limit", 1, 1, 5)
-                    cap = self._cfg_int("profile_max_chars", 120, 40, 600)
+                    cap = self._cfg_int("profile_max_chars", 80, 40, 600)
+                    # ★ 问的是"他自己"时多给材料：实测「宁宁求锐评我」在 80 字上限下
+                    #   只剩 4 条事实（身份/互动/口头禅…），模型只能泛泛地答
+                    #   （回一句"话太少了"）。这类问题把上限放到 3 倍、并多取两行
+                    #   （`_member_rows` 是"画像优先"，多取的行就是这个人自己的长期记忆）。
+                    if probe or self_ref:
+                        lim = min(5, lim + 2)
+                        cap = min(400, cap * 3)
                     own = self._member_rows(self_id, group_id, uid, uname, lim)
                     if own:
                         dup = {m["id"] for m in (mems or [])}
@@ -1443,8 +1602,10 @@ class SmartMemory(Star):
                         for r in own:
                             if r["id"] in dup:
                                 continue
-                            when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
                             body = self._profile_for_inject(r, cap)
+                            if not body:      # 空壳 / 动态键全过期 → 不带这条
+                                continue
+                            when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
                             own_lines.append(f"- ({when} {r['user_name']}) {body}")
                         if own_lines:
                             parts.append("【提问者本人档案/记忆，涉及ta自己或你俩关系时以此为准】\n"
@@ -1615,16 +1776,20 @@ class SmartMemory(Star):
                         return
                     lines = ["各 bot 记忆库统计："]
                     for n in names:
-                        with closing(self._connect(os.path.join(self.db_dir, n))) as conn:
-                            long_n = conn.execute(
-                                "SELECT COUNT(*) FROM long_term"
-                            ).fetchone()[0]
-                            short_n = conn.execute(
-                                "SELECT COUNT(*) FROM short_term WHERE expire_at > ?",
-                                (time.time(),),
-                            ).fetchone()[0]
-                        bot = n[len("memory_"):-len(".db")]
-                        lines.append(f"bot {bot}: 长期 {long_n} 条，短期（保留期内）{short_n} 条")
+                        # 单库出错（半截文件 / 还没建表）不该让整条指令失败
+                        try:
+                            with closing(self._connect(os.path.join(self.db_dir, n))) as conn:
+                                long_n = conn.execute(
+                                    "SELECT COUNT(*) FROM long_term"
+                                ).fetchone()[0]
+                                short_n = conn.execute(
+                                    "SELECT COUNT(*) FROM short_term WHERE expire_at > ?",
+                                    (time.time(),),
+                                ).fetchone()[0]
+                            bot = n[len("memory_"):-len(".db")]
+                            lines.append(f"bot {bot}: 长期 {long_n} 条，短期（保留期内）{short_n} 条")
+                        except Exception as e:
+                            lines.append(f"{n}: 读取失败（{e}）")
                     yield event.plain_result("\n".join(lines))
                     return
                 with closing(self._connect(self._db_path(self_id))) as conn:

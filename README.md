@@ -51,10 +51,11 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 | `include_recent` | 是否在上下文中附带缓冲中的最近消息 | `true` |
 | `inject_recent_list` | 是否注入【最近消息】清单（与会话历史重复，建议关） | `false` |
 | `recent_count` | 附带最近消息条数 | `5` |
-| `profile_fallback` | 检索不到相关记忆时，兜底注入本人画像 | `true` |
-| `profile_limit` | 本人画像兜底注入条数 | `1` |
-| `profile_max_chars` | 每条画像注入的最大字符数（超出按优先级裁剪） | `120` |
-| `profile_dynamic_ttl_days` | 动态条目（近期情绪/事件/预算…）的注入保质期，`0` 关闭 | `3` |
+| `profile_fallback` | 检索不到相关记忆时，兜底注入本人画像（只在 `profile_inject_mode=fallback` 时生效） | `true` |
+| `profile_inject_mode` | 何时注入「说话人本人的画像」：`self` 自称/探询/没召回时 / `always` 每轮 / `fallback` 旧行为 / `off` 从不 | `self` |
+| `profile_limit` | 本人画像兜底注入条数（问到提问者自己时会自动多取 2 条） | `1` |
+| `profile_max_chars` | 每条画像注入的最大字符数（超出按优先级裁剪）。**问到提问者自己时会自动放宽到 3 倍** | `120` |
+| `profile_dynamic_ttl_days` | 动态条目（近期情绪/事件/预算…）的注入保质期，按**每个键自己的最后更新时间**算，`0` 关闭 | `3` |
 | `auto_merge_profiles` | 自动合并同一人的多行画像 | `true` |
 | `profile_identity_mode` | 画像按什么认人：`qq`（改昵称也认同一人）/ `name`（只按昵称，旧行为） | `qq` |
 | `profile_names` | 画像键归并用的「对方名字」（逗号分隔）。填了之后「与<名字>关系」归一到「关系」，「<名字>反应」进高优先保留档。**bot 自己的名字不用填，会自动识别** | 空 |
