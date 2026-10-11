@@ -407,7 +407,10 @@ class SmartMemory(Star):
         os.makedirs(self.db_dir, exist_ok=True)
         self._legacy_db = os.path.join(self.db_dir, "memory.db")  # 旧版单库（升级后仅迁移一次）
         self._ensured: set = set()       # 已初始化（建表）的 bot 库
-        self._organizing: set = set()    # 正在整理的群，避免并发重复触发
+        self._organizing: set = set()    # 正在整理的群，避免并发重复触发（实例内）
+        # ★ 插件被卸载/重载时由 terminate() 置真。整理要跑十几秒，旧实例的迟到结果
+        #   若照写，而新实例也整理了同一批消息，同一批就成了两条记忆（10-11 实测）。
+        self._stopped: bool = False
         self._consolidated: set = set()  # 已做过画像合并的 (库, 作用域)
         self._organize_backoff: dict = {}  # 群 -> 上次整理失败时间（失败退避用）
         self._last_purge: float = 0.0      # 上次物理清理过期短期记忆的时间
@@ -433,6 +436,20 @@ class SmartMemory(Star):
             )
         )
         self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
+
+    async def terminate(self):
+        """插件被卸载 / 重载时由框架调用（必须定义在本类里，框架用 __dict__ 判断）。
+
+        为什么要它：整理一次要跑十几秒到一分钟，重载后**旧实例的协程还在跑**
+        （实测 19:56:48 开始的那次整理在 19:57:02 重载之后，仍于 19:58:08 写了库），
+        而新实例会把同一批消息再整理一遍 → 同一批消息两条记忆、还多烧一次上万字符的请求。
+        这里只置一个标记：迟到的整理结果在写库前看到标记就作废，**消息留在缓冲里**
+        下次照常整理，不丢记忆，只是延后。
+        """
+        self._stopped = True
+        self._log(
+            f"[{self._log_tag()}] 已停止：正在跑的整理不再写库（消息留在缓冲，下次重来）"
+        )
 
     # ---------------- 数据库（按 bot self_id 分库） ----------------
     def _db_path(self, self_id=None) -> str:
@@ -637,6 +654,44 @@ class SmartMemory(Star):
                 asyncio.create_task(self._organize(self_id, group_id))
 
     # ---------------- 满阈值 AI 整理 ----------------
+    def _organize_claims(self) -> dict:
+        """跨实例的整理占位表，**挂在框架 context 上**（重载后新实例仍看得见旧实例）。
+
+        本地 self._organizing 是实例内的锁，重载后新实例拿到的是新集合，挡不住旧实例：
+        实测「重载撞上整理」时，同一个群的同一批消息被整理了两遍（多写 13/14 行记忆）。
+        """
+        try:
+            reg = getattr(self.context, "_stardust_organize_claims", None)
+            if not isinstance(reg, dict):
+                reg = {}
+                setattr(self.context, "_stardust_organize_claims", reg)
+            return reg
+        except Exception:
+            return {}      # 拿不到就退化成"没有跨实例保护"，不影响单实例的正确性
+
+    @staticmethod
+    def _claim_is_mine(claims: dict, job_key: str, token: int) -> bool:
+        v = claims.get(job_key)
+        return isinstance(v, tuple) and len(v) == 2 and v[1] == token
+
+    def _batch_alive(self, self_id: str, group_id: str, watermark: int) -> bool:
+        """本批（直到水位线那一行为止）是否还在缓冲里。
+
+        别的实例可能已经把这一批整理掉并删了缓冲行，此时再写一遍就是重复记忆。
+        查不了就按"还在"处理——宁可多写一次，也别把该记的丢了。
+        """
+        if not watermark:
+            return True    # 没有水位线时本来也不删缓冲（旧行为），这里不做判断
+        try:
+            with closing(self._connect(self._db_path(self_id))) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM short_term WHERE id = ? AND group_id = ? LIMIT 1",
+                    (int(watermark), group_id),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return True
+
     async def _organize(self, self_id: str, group_id: str):
         """攒满阈值后：AI 提炼人物画像键值+要点记忆，存长期后清空缓冲。"""
         # 键带上 self_id：两个 bot 同时挂在同一个群时，各自的整理不该互相挡
@@ -650,7 +705,26 @@ class SmartMemory(Star):
         if last_fail and time.time() - last_fail < self.ORGANIZE_FAIL_BACKOFF:
             return
         self._organizing.add(job_key)
+        claims = self._organize_claims()
+        token = id(self)
         try:
+            # ★ 跨实例占位：重载后旧实例可能还在跑同一批，直接放弃本次触发，
+            #   省掉一次上万字符的请求（实测重复整理烧掉的正是这一份）。
+            now = time.time()
+            for k, v in list(claims.items()):
+                ts = v[0] if isinstance(v, tuple) else v
+                try:
+                    stale = now - float(ts) > self.ORGANIZE_CLAIM_TTL
+                except (TypeError, ValueError):
+                    stale = True
+                if stale:
+                    claims.pop(k, None)   # 占位过期（上个实例可能已崩）→ 回收，别卡住这个群
+            if job_key in claims and not self._claim_is_mine(claims, job_key, token):
+                self._log(
+                    f"[{self._log_tag(self_id)}] 群 {group_id} 有另一个实例正在整理，跳过本次触发"
+                )
+                return
+            claims[job_key] = (now, token)
             self._log(f"[{self._log_tag(self_id)}] _organize 被调用，群 {group_id}")
             threshold = int(self.config.get("organize_threshold", 100))
             # 取数上限不能小于阈值，否则阈值被调大后就永远凑不满、永远不整理
@@ -732,6 +806,18 @@ class SmartMemory(Star):
                 self._organize_backoff[job_key] = time.time()
                 self._log(f"[{self._log_tag(self_id)}] 解析不出 JSON，{self.ORGANIZE_FAIL_BACKOFF}s 内不再重试本群")
                 return
+            # ★ 写库前的两道闸（10-11 实测的"同一批消息写两遍"）：
+            #   ① 插件已被卸载/重载（terminate 置位）→ 旧实例的迟到结果作废；
+            #   ② 这一批已被别的实例整理掉并从缓冲删了 → 再写就是重复。
+            #   两种情况都**不写库也不删缓冲**：消息留在缓冲里，下次整理照常处理，不丢记忆。
+            stopped = getattr(self, "_stopped", False)
+            if stopped or not self._batch_alive(self_id, group_id, watermark):
+                self._log(
+                    f"[{self._log_tag(self_id)}] 群 {group_id} 整理结果作废"
+                    f"（{'插件已停止' if stopped else '本批已被其它实例处理'}，"
+                    f"水位线 id={watermark}）：不写库、不删缓冲"
+                )
+                return
             saved = 0
             # 昵称 → QQ 映射（本次缓冲里的真实发言者）：LLM 只回昵称，这里把昵称认回 QQ，
             # 作为画像的分组锚点，免得对方一改昵称就另开一行档案。
@@ -775,6 +861,9 @@ class SmartMemory(Star):
             self._log(f"[{self._log_tag(self_id)}] AI 整理失败: {e}")
         finally:
             self._organizing.discard(job_key)
+            # 只释放自己的占位（别把接管后的新实例的占位删掉）
+            if self._claim_is_mine(claims, job_key, token):
+                claims.pop(job_key, None)
 
     # ---------------- bot 名字（按 bot 自动识别，代码里不写死角色名） ----------------
     def _plugin_display_name(self) -> str:
@@ -1049,6 +1138,7 @@ class SmartMemory(Star):
     PROFILE_MAX_KEYS = 24
     PROFILE_MAX_CHARS = 900
     ORGANIZE_FAIL_BACKOFF = 120   # 整理失败后，本群多少秒内不再重试（防按条烧 token）
+    ORGANIZE_CLAIM_TTL = 300      # 跨实例整理占位的有效期；超时视为上个实例已崩，回收再占
 
     @classmethod
     def _profile_key(cls, uname: str) -> str:
