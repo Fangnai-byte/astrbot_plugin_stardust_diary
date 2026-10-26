@@ -1595,6 +1595,42 @@ class SmartMemory(Star):
         m = str(self.config.get("semantic_recall", "off") or "off").strip().lower()
         return m if m in ("off", "auto", "always") else "off"
 
+    def _vec_model_line(self, self_id: str, group_id: str) -> str:
+        """一行说清「库里的向量是谁建的」——只做展示，不做判定、不迁移。
+
+        向量表里 model 是建向量时记下的模型名；早期版本取不到就写成空串，
+        所以这里把空串显示成「未登记」，并顺带列出当前配置的嵌入模型，
+        方便换模型后一眼看出有没有错位。
+        """
+        try:
+            with closing(self._connect(self._db_path(self_id))) as conn:
+                rows = conn.execute(
+                    "SELECT model, dim, COUNT(*) FROM long_term_vec WHERE id IN "
+                    "(SELECT id FROM long_term WHERE group_id = ?) "
+                    "GROUP BY model, dim ORDER BY COUNT(*) DESC",
+                    (group_id,),
+                ).fetchall()
+        except Exception as e:  # noqa: BLE001
+            return f"向量：读取失败（{e}）"
+        if not rows:
+            return "向量：0 条（还没建）"
+        parts = [f"{(m or '未登记')}/{d or '?'}维 ×{c}" for m, d, c in rows]
+        cur = ""
+        emb = self._providers("embedding")
+        if emb is not None:
+            try:
+                cur = str(emb.meta().model or emb.meta().id or "")
+            except Exception:  # noqa: BLE001
+                cur = ""
+        line = "向量：" + "、".join(parts)
+        if cur:
+            known = {str(m) for m, _d, _c in rows if m}
+            if known and cur not in known:
+                line += f" ← 当前模型「{cur}」不一致，语义召回会失真"
+            elif not known:
+                line += f"（建向量时没记下模型名；当前模型「{cur}」）"
+        return line
+
     def _semantic_status(self) -> str:
         """一行话说清语义召回现在到底会不会生效（给 /mem stat 用）。"""
         mode = self._semantic_mode()
@@ -2433,7 +2469,8 @@ class SmartMemory(Star):
                     f"本群记忆统计：长期 {long_n} 条，短期（保留期内）{short_n} 条\n"
                     f"全文索引：{fts}\n"
                     f"整库召回：{'开' if self.config.get('search_extra_recall', True) else '关'}\n"
-                    f"语义召回：{self._semantic_status()}"
+                    f"语义召回：{self._semantic_status()}\n"
+                    f"{self._vec_model_line(self_id, group_id)}"
                 )
             except Exception as e:
                 yield event.plain_result(f"统计失败: {e}")
