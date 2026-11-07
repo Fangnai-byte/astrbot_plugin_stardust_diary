@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sqlite3
 import time
 from contextlib import closing
@@ -420,13 +421,73 @@ def _pack_profile(
 
 # 命中这些词的消息才值得交给 LLM 判断（节省 token）
 class SmartMemory(Star):
+    LEGACY_DB_DIRNAME = "smart_memory"
+
+    @staticmethod
+    def _plugin_data_dir() -> str:
+        """data/plugin_data/astrbot_plugin_stardust_diary/"""
+        try:
+            from astrbot.core.star.star_tools import StarTools
+
+            return str(StarTools.get_data_dir("astrbot_plugin_stardust_diary"))
+        except Exception:  # noqa: BLE001
+            return os.path.join(
+                get_astrbot_data_path(), "plugin_data", "astrbot_plugin_stardust_diary")
+
+    @classmethod
+    def _resolve_db_dir(cls) -> str:
+        """新目录没有数据、老目录有时，复制一份过来。
+
+        只搬正在用的文件（memory*.db 与 plugin.log），不碰 .bak。
+        复制失败就退回老目录继续用，宁可位置不合规也别丢记忆。
+        """
+        new_dir = os.path.join(cls._plugin_data_dir(), cls.LEGACY_DB_DIRNAME)
+        legacy_dir = os.path.join(get_astrbot_data_path(), cls.LEGACY_DB_DIRNAME)
+        try:
+            os.makedirs(new_dir, exist_ok=True)
+        except OSError:
+            return legacy_dir
+        if os.path.isdir(legacy_dir):
+            if True:
+                copied = 0
+                for name in os.listdir(legacy_dir):
+                    if not (name.endswith(".db") or name == "plugin.log"):
+                        continue
+                    src = os.path.join(legacy_dir, name)
+                    dst = os.path.join(new_dir, name)
+                    if not os.path.isfile(src):
+                        continue
+                    # 新目录已有同名文件时，只在老文件更新时才覆盖：
+                    # 插件重载前老代码还在往老库写，那一小段不能丢；
+                    # 而老目录一旦停止更新，mtime 不会变，也就不会反复覆盖。
+                    if os.path.exists(dst):
+                        try:
+                            if os.path.getmtime(src) <= os.path.getmtime(dst) + 1:
+                                continue
+                        except OSError:
+                            continue
+                    try:
+                        shutil.copy2(src, dst)
+                        copied += 1
+                    except OSError as exc:
+                        logger.warning(
+                            "[SmartMemory] 迁移 %s 失败: %s（继续用老目录）", name, exc)
+                        return legacy_dir
+                if copied:
+                    logger.info(
+                        "[SmartMemory] 已把 %d 个记忆文件迁移到 %s（旧目录保留作备份）",
+                        copied, new_dir)
+        return new_dir
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         set_profile_names(config.get("profile_names", ""))
         self._bot_names: dict[str, str] = {}   # self_id(QQ) -> 这个 bot 的名字（自动学到/配置指定）
-        data_dir = get_astrbot_data_path()
-        self.db_dir = os.path.join(data_dir, "smart_memory")
+        # 记忆库放 data/plugin_data/<plugin>/smart_memory。
+        # 直接放 data/smart_memory 是早期写法，审核要求持久化数据归到插件数据目录下：
+        # 这样用户迁移/备份只搬 plugin_data，插件更新也不会碰到这些文件。
+        self.db_dir = self._resolve_db_dir()
         os.makedirs(self.db_dir, exist_ok=True)
         self._legacy_db = os.path.join(self.db_dir, "memory.db")  # 旧版单库（升级后仅迁移一次）
         self._ensured: set = set()       # 已初始化（建表）的 bot 库
@@ -521,6 +582,16 @@ class SmartMemory(Star):
     def _connect(self, db_path: str) -> sqlite3.Connection:
         conn = sqlite3.connect(db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        # 三个群同时整理时，检索这边也要连同一个库：
+        #   busy_timeout —— 撞上写事务就等，别立刻抛（默认 5 秒，短了）
+        #   temp_store=memory —— 排序/去重不走临时文件。
+        #     临时文件建不出来时 SQLite 报的是 "unable to open database file"，
+        #     和"库打不开"同一个措辞，很容易误判成库坏了（qzone_publish 那边踩过）。
+        for pragma in ("pragma busy_timeout = 10000", "pragma temp_store = memory"):
+            try:
+                conn.execute(pragma)
+            except Exception:  # noqa: BLE001
+                pass
         return conn
 
     @classmethod
@@ -1861,8 +1932,21 @@ class SmartMemory(Star):
     def _search_long(self, self_id: str, group_id: str, query: str, top_k: int = 5):
         query = (query or "").strip()
         q_norm = _norm(query)
+        db_path = self._db_path(self_id)
+        conn = None
+        # 瞬时争用（别的线程正在整理同一个库）会给 "unable to open database file"，
+        # 隔一小会儿重试一次基本就过去了；两次都失败才当真的异常。
+        for attempt in (1, 2):
+            try:
+                conn = self._connect(db_path)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 2:
+                    logger.warning(f"[SmartMemory] 检索连库失败（库={db_path}）: {e}")
+                    return []
+                time.sleep(0.3)
         try:
-            with closing(self._connect(self._db_path(self_id))) as conn:
+            with closing(conn) as conn:
                 cands: dict = {}
                 for r in conn.execute(
                     "SELECT * FROM long_term WHERE group_id = ? "
@@ -1882,7 +1966,8 @@ class SmartMemory(Star):
                         cands.setdefault(r["id"], r)
                 rows = list(cands.values())
         except Exception as e:
-            logger.warning(f"[SmartMemory] 检索失败: {e}")
+            # 把库路径带上：只报一句 "unable to open database file" 时根本不知道是哪个 bot
+            logger.warning(f"[SmartMemory] 检索失败（库={db_path}）: {e}")
             return []
         scored = []
         time_level = self._detect_time_intent(query)

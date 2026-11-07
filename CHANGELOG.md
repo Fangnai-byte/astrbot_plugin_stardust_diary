@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.7.2] - 2026-11-07
+
+### 变更：记忆库位置迁到 data/plugin_data/
+- 审核意见：持久化数据必须放在 `data/plugin_data/<plugin_name>/` 下。
+  之前记忆库与 `plugin.log` 都在 `data/smart_memory/`。
+- 现在统一到 `data/plugin_data/astrbot_plugin_stardust_diary/smart_memory/`。
+- 升级自动迁移：新目录为空时复制老目录里的 `memory*.db` 与 `plugin.log`，
+  老目录保留不删；复制按文件 mtime 判断，重载前老代码写进去的内容也会补上。
+- `.bak` 备份文件不参与迁移。
+
 ## [1.7.1] - 2026-10-26
 
 ### 新增：`/mem stat` 多显示一行「向量是谁建的」

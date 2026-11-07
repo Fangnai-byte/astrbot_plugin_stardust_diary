@@ -140,10 +140,20 @@ https://github.com/Fangnai-byte/astrbot_plugin_stardust_diary
 
 ## 数据位置
 
-- 数据库：`<AstrBot根目录>/data/smart_memory/memory_<self_id>.db`（每个 bot 实例一个库，多开互不干扰）
+- 数据库：`<AstrBot根目录>/data/plugin_data/astrbot_plugin_stardust_diary/smart_memory/memory_<self_id>.db`（每个 bot 实例一个库，多开互不干扰）
   - 旧版单库 `memory.db` 会在首个 bot 触发时自动原子迁移（改名）为对应实例的库，仅迁移一次，旧数据不丢
-- 插件日志：`<AstrBot根目录>/data/smart_memory/plugin.log`
+- 插件日志：`<AstrBot根目录>/data/plugin_data/astrbot_plugin_stardust_diary/smart_memory/plugin.log`
 - 插件配置：`<AstrBot根目录>/data/config/astrbot_plugin_stardust_diary_config.json`
+
+## 升级到 1.7.2 的数据迁移
+
+1.7.2 起记忆库从 `data/smart_memory/` 移到
+`data/plugin_data/astrbot_plugin_stardust_diary/smart_memory/`（审核要求持久化数据归到插件数据目录）。
+
+不用手动搬：插件启动时如果发现新目录是空的，会把老目录里的 `memory*.db` 和 `plugin.log`
+复制过去，老目录原样保留当备份。复制按文件修改时间判断，重载前老代码写进老库的那一小段也会补过来。
+
+确认没有问题之后，`data/smart_memory/` 可以手动删掉，或者留着当快照。
 
 ## 常见问题
 
