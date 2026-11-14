@@ -1055,6 +1055,10 @@ class SmartMemory(Star):
                     if u and u != "system" and u not in seen:
                         seen.add(u)
                         speakers.append((n, u))
+                # ★ 2026-11-14：这张表会把真实 QQ 号随消息一起发给模型供应商。
+                #   不想外发就把 roster_in_prompt 关掉：正文照旧，认人退化成昵称。
+                if not self.config.get("roster_in_prompt", True):
+                    return "", "\n".join(line for _r, line in rows)
                 roster = "；".join(f"{n}={u}" for n, u in speakers[:80])
                 body = "\n".join(line for _r, line in rows)
                 head = "【群成员QQ对照】" + roster + "\n\n"
@@ -1082,7 +1086,9 @@ class SmartMemory(Star):
                     "只记录明确出现过的信息，不要编造。\n"
                     "2. 提取值得长期记住的要点（约定、事件、计划、重要信息）。\n"
                     "记录格式：开头是一张【群成员QQ对照】表（昵称=QQ），之后每行是「昵称: 内容」。"
-                    "写画像时请额外带上 QQ 键，值从对照表里查（例如 QQ=10001）。\n"
+                    + ("写画像时请额外带上 QQ 键，值从对照表里查（例如 QQ=10001）。\n"
+                       if self.config.get("roster_in_prompt", True) else "")
+                    +
                     "只输出一个JSON对象："
                     '{"profiles": [{"user": "昵称", "attrs": {"键": "值"}}], '
                     '"memories": [{"content": "要点", "keywords": ["关键词"]}]}'
@@ -1539,6 +1545,17 @@ class SmartMemory(Star):
                 kv_ts[k] = v
         for k, v in (kv_ts_new or {}).items():
             kv_ts[k] = v
+        # ★ 2026-11-14：老画像里的动态键（近期情绪/事件/预算…）没有 kv_ts 记录，
+        #   注入时会退回去用 created_at，而 created_at 每次合并都被刷成"现在"，
+        #   于是三周前的"近期情绪"永远按近期注入。这里在合并时给缺时间戳的键
+        #   补一个"上一行的时间"，让它按真实年龄过期。
+        try:
+            prev_ts = float(rows[-1]["created_at"]) if rows else time.time()
+        except Exception:
+            prev_ts = time.time()
+        for k in work:
+            if k not in kv_ts:
+                kv_ts[k] = prev_ts
         kv_ts = {k: v for k, v in kv_ts.items() if k in work}   # 顺手清掉已不在的键
         content = _pack_profile(
             identity, work, self.PROFILE_MAX_KEYS, self.PROFILE_MAX_CHARS,
@@ -2168,11 +2185,13 @@ class SmartMemory(Star):
                 args.append(pat)
             conds.append("user_id = ?")
             args.append(uid)
-        if name:
-            # ★ 昵称必须转义：不转义时昵称里的 % / _ 会当通配符，
-            #   把别人的画像当成"本人"返回（实测传 '%' 会命中整个库的画像行）
-            conds.append("user_name LIKE ? ESCAPE '\\'")
-            args.append(f"%{_like_escape(name)}%")
+        if name and not uid:
+            # ★ 2026-11-14：以前是无条件 LIKE '%名字%'。昵称是别人昵称的子串时
+            #   （「喵」「小」），会把别人的画像当成「本人」注入；昵称是「群聊记录」
+            #   的子串时更狠，会命中该作用域上万条要点。现在只在 QQ 锚点失效时用，
+            #   而且要求完全相等。
+            conds.append("user_name = ?")
+            args.append(name)
         if not conds:
             return []
         args.append(limit)
@@ -2403,7 +2422,9 @@ class SmartMemory(Star):
           才走语义兜底（一次嵌入 + 一次重排，约 0.8 秒）。实测触发率约 8%
         - `always`：每轮都把语义候选并进来（召回最全，但每轮多约 0.8 秒）
         """
-        mems = self._search_long(self_id, group_id, query, top_k)
+        # 同步检索（扫 5000 行 + FTS + 关键词打分）实测 22 ms 起，装在事件循环上会
+        # 卡住所有群的所有插件；挪到线程里跑。
+        mems = await asyncio.to_thread(self._search_long, self_id, group_id, query, top_k)
         mode = self._semantic_mode()
         if mode == "off":
             return mems
@@ -2664,7 +2685,8 @@ class SmartMemory(Star):
             return
 
         if sub in ("清理", "vacuum", "vac"):
-            yield event.plain_result(self._vacuum_vectors(self_id))
+            # DELETE + VACUUM 是秒级阻塞，别卡事件循环
+            yield event.plain_result(await asyncio.to_thread(self._vacuum_vectors, self_id))
             return
 
         if sub == "recent":
