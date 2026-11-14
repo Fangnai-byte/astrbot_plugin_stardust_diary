@@ -1329,11 +1329,17 @@ class SmartMemory(Star):
             logger.warning(f"[{self._log_tag()}] 保存插件配置失败: {e}")
 
     def _count_short(self, self_id: str, group_id: str) -> int:
+        """算触发阈值用的条数。
+
+        不数机器人自己说的话：那些行不进提炼（见 `_all_short`），
+        数进去会导致"凑够 100 条该整理了"，取出来过滤后却不够，整理被反复空跑。
+        """
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
-                    "SELECT COUNT(*) FROM short_term WHERE group_id = ? AND expire_at > ?",
-                    (group_id, time.time()),
+                    "SELECT COUNT(*) FROM short_term WHERE group_id = ? AND expire_at > ? "
+                    "AND user_id != ?",
+                    (group_id, time.time(), str(self_id)),
                 ).fetchone()[0]
         except Exception:
             return 0
@@ -1803,7 +1809,8 @@ class SmartMemory(Star):
 
     def _vec_ok(self) -> bool:
         try:
-            import numpy  # noqa: F401
+            import numpy as _np  # noqa: F401  # 只用它探依赖在不在
+            _ = _np.__version__
             return True
         except Exception:
             return False
@@ -2661,7 +2668,7 @@ class SmartMemory(Star):
                         (group_id, time.time()),
                     ).fetchone()[0]
                     try:
-                        idx_n = conn.execute(
+                        conn.execute(
                             "SELECT COUNT(*) FROM long_term_fts WHERE long_term_fts MATCH ?",
                             ("a",),
                         ).fetchone()[0]
