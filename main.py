@@ -459,7 +459,7 @@ class SmartMemory(Star):
         except OSError:
             return legacy_dir
         if os.path.isdir(legacy_dir):
-            if True:
+            if True:  # noqa: SIM103 —— 保留缩进层级，方便读
                 copied = 0
                 for name in os.listdir(legacy_dir):
                     if not (name.endswith(".db") or name == "plugin.log"):
@@ -580,7 +580,9 @@ class SmartMemory(Star):
             except Exception as exc:
                 logger.warning(f"[SmartMemory] 启动准备失败: {exc}")
 
-        self._tasks.add(asyncio.create_task(_bootstrap()))
+        boot = asyncio.create_task(_bootstrap())
+        self._tasks.add(boot)
+        boot.add_done_callback(self._tasks.discard)
 
         if self._semantic_mode() == "off" or not self._vec_ok():
             return
@@ -605,8 +607,16 @@ class SmartMemory(Star):
         下次照常整理，不丢记忆，只是延后。
         """
         self._stopped = True
-        for task in list(getattr(self, "_tasks", ())):
+        tasks = [t for t in getattr(self, "_tasks", ()) if not t.done()]
+        for task in tasks:
             task.cancel()
+        if tasks:
+            # to_thread 里的活取消不掉（线程不响应取消），这里等一小会儿让它收尾，
+            # 别让旧实例的协程在重载后继续碰库。
+            try:
+                await asyncio.wait(tasks, timeout=3)
+            except Exception:
+                pass
         self._tasks.clear()
         self._log(
             f"[{self._log_tag()}] 已停止：正在跑的整理不再写库（消息留在缓冲，下次重来）"
@@ -962,7 +972,9 @@ class SmartMemory(Star):
         if self.config.get("organize_enabled", True):
             n = self._count_short(self_id, group_id)
             if n >= int(self.config.get("organize_threshold", 100)):
-                asyncio.create_task(self._organize(self_id, group_id))
+                task = asyncio.create_task(self._organize(self_id, group_id))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
 
     # ---------------- 满阈值 AI 整理 ----------------
     def _organize_claims(self) -> dict:
@@ -1045,7 +1057,6 @@ class SmartMemory(Star):
                 return
             # ★ 记下这批消息的最大 id：整理要跑十几秒，这期间新消息还在往缓冲里写，
             #   收尾时只能删到这条为止，否则会**静默丢掉这段时间的新消息**。
-            watermark = self._short_watermark(msgs)
             try:
                 max_chars = int(self.config.get("organize_max_chars", 12000) or 12000)
             except (TypeError, ValueError):
@@ -1108,7 +1119,10 @@ class SmartMemory(Star):
                     "1. 为活跃成员建立人物画像，用键值对记录稳定属性（如 生日/喜欢/讨厌/身份/口头禅），"
                     "只记录明确出现过的信息，不要编造。\n"
                     "2. 提取值得长期记住的要点（约定、事件、计划、重要信息）。\n"
-                    "记录格式：开头是一张【群成员QQ对照】表（昵称=QQ），之后每行是「昵称: 内容」。"
+                    + ("记录格式：开头是一张【群成员QQ对照】表（昵称=QQ），之后每行是「昵称: 内容」。"
+                       if self.config.get("roster_in_prompt", True)
+                       else "记录格式：每行是「昵称: 内容」。")
+                    +
                     + ("写画像时请额外带上 QQ 键，值从对照表里查（例如 QQ=10001）。\n"
                        if self.config.get("roster_in_prompt", True) else "")
                     +
@@ -1193,7 +1207,9 @@ class SmartMemory(Star):
                 self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 整理完成，新增 {saved} 条长期记忆")
                 # 新写进去的记忆顺手补向量（后台，不拖慢整理收尾）
                 if self._semantic_mode() != "off" and self._vec_ok():
-                    asyncio.create_task(self._embed_pending(self_id, group_id))
+                    task = asyncio.create_task(self._embed_pending(self_id, group_id))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
             else:
                 self._log(f"[{self._log_tag(self_id)}] 群 {group_id} 整理完成，没新增长期记忆")
         except Exception as e:
@@ -1386,9 +1402,11 @@ class SmartMemory(Star):
                         s = s[start:i + 1]
                         break
         try:
-            return json.loads(s)
+            data = json.loads(s)
         except Exception:
             return None
+        # 模型偶尔吐数组（[1,2,3]/[{...}]），调用点会 data.get 直接 AttributeError
+        return data if isinstance(data, dict) else None
 
     def _pick_provider(self):
         """按配置选择 AI 整理用的供应商；未配置则用当前对话模型。"""
@@ -2276,11 +2294,16 @@ class SmartMemory(Star):
         today = datetime(now.year, now.month, now.day)
         if level == "L2":
             return today.timestamp(), now.timestamp()
+        if level == "L3Y":                      # 昨天一整天
+            return (today - timedelta(days=1)).timestamp(), today.timestamp()
         if level == "L3":
             return (today - timedelta(days=3)).timestamp(), (today if private else now).timestamp()
         if level == "L4":
             week_start = today - timedelta(days=now.weekday())
-            return week_start.timestamp(), (today if private else now).timestamp()
+            # 周一当天 week_start == today，私聊压到今天 0 点就成了空窗口；
+            # 这种时候把终点放回「现在」，否则问「本周」什么都拿不到。
+            end = today if (private and week_start < today) else now
+            return week_start.timestamp(), end.timestamp()
         if level == "L5":
             this_monday = today - timedelta(days=now.weekday())
             return (this_monday - timedelta(days=7)).timestamp(), this_monday.timestamp()
@@ -2295,7 +2318,9 @@ class SmartMemory(Star):
         q = query or ""
         if any(k in q for k in ("上周", "上个星期", "上星期", "上礼拜")):
             return "L5"
-        if any(k in q for k in ("昨天", "昨晚", "昨日", "昨夜", "前天", "大前天", "前晚")):
+        if any(k in q for k in ("昨天", "昨晚", "昨日", "昨夜")):
+            return "L3Y"          # 只取昨天那一天
+        if any(k in q for k in ("前天", "大前天", "前晚")):
             return "L3"
         if any(k in q for k in ("最近", "这两天", "这几天", "前两天")):
             return "L3"
@@ -2408,7 +2433,7 @@ class SmartMemory(Star):
         emb_to = self._cfg_float("semantic_embed_timeout", 5.0, 0.5, 30.0)
         try:
             qv = await asyncio.wait_for(self._embed_texts([query]), timeout=emb_to)
-        except (asyncio.TimeoutError, Exception) as e:
+        except Exception as e:
             logger.debug("[SmartMemory] 语义召回：嵌入超时/失败（%s），本轮跳过", e)
             return []
         if not qv:
@@ -2462,7 +2487,7 @@ class SmartMemory(Star):
             except Exception as e:
                 logger.debug("[SmartMemory] 重排失败，退回余弦排序: %s", e)
         # 没有重排模型时，余弦门槛提高一点（避免硬塞不相关的旧事）
-        return [(r, c, 0.0) for r, c in cand if c >= max(0.62, 0.0)]
+        return [(r, c, 0.0) for r, c in cand if c >= 0.62]
 
     async def _search_long_async(self, self_id: str, group_id: str, query: str, top_k: int = 5):
         """文字召回 +（按需）语义召回 +（可选）重排。
@@ -2505,6 +2530,10 @@ class SmartMemory(Star):
         """
         try:
             if not bool(self.config.get("record_bot_reply", True)):
+                return
+            if event.get_message_type() not in (
+                MessageType.GROUP_MESSAGE, MessageType.FRIEND_MESSAGE
+            ):
                 return
             result = event.get_result()
             if result is None:
@@ -2583,7 +2612,7 @@ class SmartMemory(Star):
             if uid and want_profile:
                 try:
                     lim = self._cfg_int("profile_limit", 1, 1, 5)
-                    cap = self._cfg_int("profile_max_chars", 80, 40, 600)
+                    cap = self._cfg_int("profile_max_chars", 120, 40, 600)
                     # ★ 问的是"他自己"时多给材料：实测「宁宁求锐评我」在 80 字上限下
                     #   只剩 4 条事实（身份/互动/口头禅…），模型只能泛泛地答
                     #   （回一句"话太少了"）。这类问题把上限放到 3 倍、并多取两行
@@ -2629,7 +2658,8 @@ class SmartMemory(Star):
                 start_ts, end_ts = self._time_window(level, private=str(group_id).startswith("priv_"))
                 n = int(self.config.get("recent_count", 5)) * 2
                 rows = self._recent_short_since(self_id, group_id, start_ts, n, end_ts)
-                label = {"L2": "今天", "L3": "最近三天", "L4": "本周", "L5": "上周"}.get(level, level)
+                label = {"L2": "今天", "L3Y": "昨天", "L3": "最近三天",
+             "L4": "本周", "L5": "上周"}.get(level, level)
                 if rows:
                     lines = [
                         f"- {datetime.fromtimestamp(r['created_at']).strftime('%m-%d %H:%M')} "
@@ -2773,7 +2803,7 @@ class SmartMemory(Star):
                     if not row:
                         yield event.plain_result("没有找到这条记忆（只能操作本群的）")
                         return
-                    if str(row["user_id"]) != user_id and not event.is_admin():
+                    if str(row["user_id"]) != user_id:   # 上面已强制管理员
                         yield event.plain_result("这不是你的记忆，只有管理员能删哦～")
                         return
                     conn.execute("DELETE FROM long_term WHERE id = ?", (mid,))
@@ -2795,7 +2825,7 @@ class SmartMemory(Star):
                 return
             lines = ["可用模型供应商："]
             for p in providers:
-                m = p.meta
+                m = p.meta()          # meta 在 AstrBot 4.28 是方法，不是属性
                 lines.append(f"- {m.id}（{m.type}）当前模型：{m.model}")
                 try:
                     models = await p.get_models()
