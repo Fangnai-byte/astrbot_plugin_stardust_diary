@@ -509,6 +509,9 @@ class SmartMemory(Star):
         self._consolidated: set = set()  # 已做过画像合并的 (库, 作用域)
         self._organize_backoff: dict = {}  # 群 -> 上次整理失败时间（失败退避用）
         self._last_purge: float = 0.0      # 上次物理清理过期短期记忆的时间
+        # 后台任务集合：create_task 的返回值必须留引用，否则可能被半路回收；
+        # terminate 也要能取消它们。
+        self._tasks: set = set()
         self._refresh_profile_names()    # 把自动识别到的 bot 名字并进画像别名
         self._log(
             f"[{self._log_tag()}] bot 名字: "
@@ -559,8 +562,9 @@ class SmartMemory(Star):
         else:
             _sem = f"{_mode}（嵌入 {_name(_emb)}；重排 {_name(_rrk) or '未配置，用余弦排序'}）"
         self._log(f"[{self._log_tag()}] 语义召回: {_sem}")
-        self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
-        self._auto_shrink()              # 向量已清空的库，启动时压一次
+        # ★ 2026-11-14：这里不做重活。_init_all_db（逐库建表 + 画像合并扫描）和
+        #   _auto_shrink（52 MB 库的 VACUUM）是秒级阻塞，放在 __init__ 里会把
+        #   整只 bot 的启动卡住。改到 initialize() 里用线程跑。
 
     async def initialize(self):
         """框架在插件加载后调用：把"补向量"这类后台活儿挂起来（不阻塞加载）。
@@ -568,6 +572,16 @@ class SmartMemory(Star):
         只补「要点提取」的向量（画像走另一条注入路径）。分批、可中断、可续跑，
         两个实例同时跑也只会有一个真的在调接口（占位表挂在 context 上）。
         """
+        # 建表/合并/压缩都在线程里跑，别卡启动；失败只记日志。
+        async def _bootstrap():
+            try:
+                await asyncio.to_thread(self._init_all_db)
+                await asyncio.to_thread(self._auto_shrink)
+            except Exception as exc:
+                logger.warning(f"[SmartMemory] 启动准备失败: {exc}")
+
+        self._tasks.add(asyncio.create_task(_bootstrap()))
+
         if self._semantic_mode() == "off" or not self._vec_ok():
             return
         try:
@@ -577,7 +591,9 @@ class SmartMemory(Star):
             return
         for n in names:
             sid = n[len("memory_"):-len(".db")]
-            asyncio.create_task(self._embed_pending(sid))
+            task = asyncio.create_task(self._embed_pending(sid))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
 
     async def terminate(self):
         """插件被卸载 / 重载时由框架调用（必须定义在本类里，框架用 __dict__ 判断）。
@@ -589,6 +605,9 @@ class SmartMemory(Star):
         下次照常整理，不丢记忆，只是延后。
         """
         self._stopped = True
+        for task in list(getattr(self, "_tasks", ())):
+            task.cancel()
+        self._tasks.clear()
         self._log(
             f"[{self._log_tag()}] 已停止：正在跑的整理不再写库（消息留在缓冲，下次重来）"
         )
@@ -775,7 +794,11 @@ class SmartMemory(Star):
             with closing(self._connect(db_path)) as conn, conn:
                 self._schema(conn)
         except Exception as e:
+            # ★ 2026-11-14：失败就不登记。以前失败也照样 add，于是本进程内这张库
+            #   永远不再重试建表，之后每条消息都 "no such table" 只留一行 warning，
+            #   等于静默丢记忆，直到重启。
             logger.warning(f"[SmartMemory] 初始化数据库失败 {db_path}: {e}")
+            return db_path
         self._cleanup_expired(db_path)
         self._ensured.add(db_path)
         return db_path
@@ -1336,9 +1359,32 @@ class SmartMemory(Star):
     def _parse_json(s: str):
         """从 LLM 输出中提取 JSON 对象（容忍 markdown 包裹或前后废话）。"""
         s = (s or "").strip()
-        m = re.search(r"\{.*\}", s, re.S)
-        if m:
-            s = m.group(0)
+        # ★ 2026-11-14：原来是贪婪 \{.*\}，模型输出两个 JSON 或句尾带花括号时
+        #   必然解析失败 → 每 120 秒重试一次上万字符的请求。改成括号配对取第一段。
+        start = s.find("{")
+        if start >= 0:
+            depth = 0
+            in_str = False
+            esc = False
+            for i in range(start, len(s)):
+                ch = s[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        s = s[start:i + 1]
+                        break
         try:
             return json.loads(s)
         except Exception:
@@ -1489,6 +1535,7 @@ class SmartMemory(Star):
     _PROFILE_SUFFIX_RE = re.compile(r"[（(][^（()）]*[)）]\s*$")
     PROFILE_MAX_KEYS = 24
     PROFILE_MAX_CHARS = 900
+    INJECT_MAX_CHARS = 1500       # 单次注入的总字数上限（记忆片段 + 画像 + 短期记录）
     ORGANIZE_FAIL_BACKOFF = 120   # 整理失败后，本群多少秒内不再重试（防按条烧 token）
     ORGANIZE_CLAIM_TTL = 300      # 跨实例整理占位的有效期；超时视为上个实例已崩，回收再占
 
@@ -1969,7 +2016,10 @@ class SmartMemory(Star):
                 model = str(prov.meta().model or "")
             except Exception:
                 pass
-            while True:
+            # ★ 2026-11-14：加总量上限。以前 while True 会一路补完整库（实测一万多条），
+            #   把 semantic_recall 从 off 打开时会连续打几十批远程嵌入请求。
+            cap_total = self._cfg_int("embed_max_per_run", 2000, 100, 20000)
+            while done < cap_total:
                 with closing(self._connect(self._db_path(self_id))) as conn:
                     sql = ("SELECT l.id, l.content FROM long_term l "
                            "LEFT JOIN long_term_vec v ON v.id = l.id "
@@ -2474,7 +2524,10 @@ class SmartMemory(Star):
             #   于是「完全不记」的群仍会持续写入机器人回复，还会被注入。
             if self._scope_disabled(group_id):
                 return
-            if text.startswith(("/mem", "/天气", "/塔罗", "/灵签")):
+            # ★ 2026-11-14：以前判断的是"回复正文以 /mem 开头"，而回执正文是
+            #   「本群最近 N 条…」，永远不成立。改成看触发它的用户消息是不是指令。
+            asked = (event.get_message_str() or "").lstrip()
+            if asked[:1] in ("/", "／"):
                 return
             self._ensure_db(self_id)
             name = self._bot_name(self_id) or "我"
@@ -2606,10 +2659,14 @@ class SmartMemory(Star):
                     ]
                     parts.append("【最近消息，可能与本条相关】\n" + "\n".join(lines))
             if parts:
+                # ★ 2026-11-14：加总长度兜底。top_k / recent_count 都能调大，
+                #   叠加超长画像时这一段可以到几万字；而它会随用户消息写进会话历史，
+                #   之后每轮都重发。这里截到 INJECT_MAX_CHARS。
+                block = "\n\n".join(parts)
+                if len(block) > self.INJECT_MAX_CHARS:
+                    block = block[:self.INJECT_MAX_CHARS] + "…"
                 # 注入到用户消息之后而非 system_prompt，保持前缀稳定，缓存才能命中
-                req.extra_user_content_parts.append(
-                    TextPart(text="\n\n".join(parts))
-                )
+                req.extra_user_content_parts.append(TextPart(text=block))
         except Exception as e:
             logger.warning(f"[SmartMemory] 注入记忆失败: {e}")
 
@@ -2720,6 +2777,12 @@ class SmartMemory(Star):
                         yield event.plain_result("这不是你的记忆，只有管理员能删哦～")
                         return
                     conn.execute("DELETE FROM long_term WHERE id = ?", (mid,))
+                    # 顺手删掉它的向量：vec 表没有触发器，只删 long_term 会留下孤儿行，
+                    # 越积越多（实测一个库 9789 条向量、38 MB）。
+                    try:
+                        conn.execute("DELETE FROM long_term_vec WHERE id = ?", (mid,))
+                    except Exception:
+                        pass
                 yield event.plain_result(f"已删除记忆 [{mid}]：{row['content']}")
             except Exception as e:
                 yield event.plain_result(f"删除失败: {e}")
