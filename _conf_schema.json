@@ -215,5 +215,11 @@
     "description": "记录机器人自己的回复",
     "default": true,
     "hint": "开着才能回答「昨天你怎么说的」这类问题；关掉只记用户说的话。"
+  },
+  "roster_in_prompt": {
+    "type": "bool",
+    "description": "整理时把「昵称=QQ」对照表发给模型",
+    "default": true,
+    "hint": "关掉后 prompt 里不再出现真实 QQ 号（少外发身份信息），代价是画像里不再自动写 QQ 键。"
   }
 }
