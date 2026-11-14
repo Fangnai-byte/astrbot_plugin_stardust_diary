@@ -544,6 +544,7 @@ class SmartMemory(Star):
             _sem = f"{_mode}（嵌入 {_name(_emb)}；重排 {_name(_rrk) or '未配置，用余弦排序'}）"
         self._log(f"[{self._log_tag()}] 语义召回: {_sem}")
         self._init_all_db()              # 为已存在的各 bot 库建表并清理过期
+        self._auto_shrink()              # 向量已清空的库，启动时压一次
 
     async def initialize(self):
         """框架在插件加载后调用：把"补向量"这类后台活儿挂起来（不阻塞加载）。
@@ -745,6 +746,34 @@ class SmartMemory(Star):
         self._cleanup_expired(db_path)
         self._ensured.add(db_path)
         return db_path
+
+    def _auto_shrink(self) -> None:
+        """向量表空着、文件却还很大的库，启动时压一次。
+
+        `/mem 清理` 只能删数据：机器人占着库时 VACUUM 拿不到锁，文件不会缩小。
+        启动这一刻还没有别的连接，正好补上，用户不用自己重载。
+        """
+        if self._semantic_mode() != "off":
+            return
+        try:
+            names = [n for n in os.listdir(self.db_dir)
+                     if re.fullmatch(r"memory_[0-9A-Za-z_-]+\.db", n)]
+        except Exception:
+            return
+        for name in names:
+            path = os.path.join(self.db_dir, name)
+            try:
+                if os.path.getsize(path) < 8 * 1024 * 1024:
+                    continue
+                with closing(self._connect(path)) as conn:
+                    left = conn.execute("SELECT COUNT(*) FROM long_term_vec").fetchone()[0]
+                    if left:
+                        continue
+                    conn.execute("PRAGMA temp_store=MEMORY")
+                    conn.execute("VACUUM")
+                logger.info(f"[SmartMemory] {name} 向量已清空，启动时压缩完成")
+            except Exception as exc:
+                logger.debug(f"[SmartMemory] {name} 启动压缩跳过: {exc}")
 
     def _init_all_db(self):
         """启动时为所有已存在的 memory_*.db 建表、清理过期，并合并同一人的多行画像。"""
@@ -2428,6 +2457,7 @@ class SmartMemory(Star):
                 conn.execute("DELETE FROM long_term_vec")
                 conn.commit()
                 try:
+                    conn.execute("PRAGMA temp_store=MEMORY")  # 默认临时目录写不进时 VACUUM 会失败
                     conn.execute("VACUUM")
                     shrunk = True
                 except Exception:
