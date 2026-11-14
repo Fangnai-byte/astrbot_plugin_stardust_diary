@@ -175,8 +175,11 @@ def _looks_like_roster(content: str) -> bool:
         return False
     # 带表头的：表头后面还得真有「昵称=数字」配对，否则「【群成员QQ对照】是什么？」这种
     # 只是提到了这句话的普通要点会被误伤
-    if t.startswith("【群成员QQ对照】"):
-        if re.search(r"[^=：:；;\s]{1,30}[=：:]\d{4,12}", t[len("【群成员QQ对照】"):]):
+    # ★ 2026-11-08：私聊漏过一条「群成员QQ对照：Fangnai=3430088565。」——
+    #   没有书名号包裹、只有一对映射。改成「提到这几个字 + 后面有配对」就拦。
+    if "群成员QQ对照" in t:
+        rest = t[t.find("群成员QQ对照") + len("群成员QQ对照"):]
+        if re.search(r"[^=：:；;\s]{1,30}[=：:]\d{4,12}", rest):
             return True
     # 整条都是「昵称=纯数字」映射（≥3 对才算，避免误伤「预算=1700」这种正常单键记忆）
     parts = [p.strip() for p in re.split(r"[；;\n,，|]", t) if p.strip()]
@@ -2404,6 +2407,39 @@ class SmartMemory(Star):
 
     # ---------------- 指令 ----------------
     @filter.permission_type(PermissionType.ADMIN)
+    def _vacuum_vectors(self, self_id: str) -> str:
+        """语义召回没开时，long_term_vec 里的向量没人读，清掉能省几十兆。
+    
+        只负责删数据。机器人开着这个库时 VACUUM 常拿不到独占锁，压不动就照实说，
+        让用户重启一次插件再清。
+        """
+        try:
+            flag = str(self.config.get("semantic_recall", "off") or "off").strip().lower()
+        except Exception:
+            flag = "off"
+        if flag in ("on", "true", "1", "yes", "开"):
+            return "语义召回开着，向量还要用，这次不清。\n想清就把 semantic_recall 设成 off 再发一次。"
+        path = self._db_path(self_id)
+        try:
+            with closing(self._connect(path)) as conn:
+                n = conn.execute("SELECT COUNT(*) FROM long_term_vec").fetchone()[0]
+                if not n:
+                    return "向量表本来就是空的，不用清。"
+                conn.execute("DELETE FROM long_term_vec")
+                conn.commit()
+                try:
+                    conn.execute("VACUUM")
+                    shrunk = True
+                except Exception:
+                    shrunk = False
+        except Exception as exc:
+            return f"清理失败：{exc}"
+        if shrunk:
+            return f"清掉 {n} 条没人用的向量，库也压缩过了。"
+        return (f"清掉 {n} 条没人用的向量。\n"
+                "文件体积暂时不会变小，库被机器人占着，压不动。\n"
+                "重启一次插件，或过一阵再发一次 /mem 清理，体积才会落下来。")
+
     @filter.command("mem", alias={"memory"})
     async def mem(self, event: AstrMessageEvent):
         # 全部子指令（list/recent/forget/models/model/stat/stat all/help）仅管理员可用
@@ -2437,6 +2473,10 @@ class SmartMemory(Star):
                 when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d %H:%M")
                 lines.append(f"[{r['id']}] ({when} {r['user_name']}) {r['content']}")
             yield event.plain_result("\n".join(lines))
+            return
+
+        if sub in ("清理", "vacuum", "vac"):
+            yield event.plain_result(self._vacuum_vectors(self_id))
             return
 
         if sub == "recent":
