@@ -158,6 +158,14 @@ def _like_escape(s: str) -> str:
     return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _is_profile_row(row) -> bool:
+    """这一行是画像，还是普通要点？画像行由合并逻辑写成「【画像】名字：k=v；…」。"""
+    try:
+        return str(row["content"] or "").lstrip().startswith("【画像】")
+    except Exception:
+        return False
+
+
 def _is_temp_recall(content: str, user_name: str = "") -> bool:
     """时效性内容（有人设保质期的「旧档」画像）不参与普通关键词召回。"""
     return "旧档" in (user_name or "")
@@ -829,6 +837,13 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 清理过期短期记忆失败: {e}")
 
     # ---------------- 消息监听 ----------------
+    def _scope_disabled(self, group_id) -> bool:
+        """这个作用域是不是被 disabled_scopes 关掉了。"""
+        scopes = self.config.get("disabled_scopes") or []
+        if isinstance(scopes, str):
+            scopes = [x.strip() for x in re.split(r"[,，;；\s]+", scopes) if x.strip()]
+        return str(group_id) in {str(x).strip() for x in scopes}
+
     def _record_filter_reason(self, event, text: str, group_id: str):
         """该不该把这条消息记进缓冲？返回 None=记，返回字符串=不记的原因。
 
@@ -855,10 +870,11 @@ class SmartMemory(Star):
             return "bot 自己的发言（避免自我循环）"
         elif mode == "triggered" and not is_private:
             # 「被唤醒/被回复到」的消息才记：开销随 bot 活跃度走，而不是随群活跃度
-            try:
-                woke = bool(getattr(event, "is_at_or_wake_command", False)) or bool(event.is_wake_up())
-            except Exception:
-                woke = True          # 判断不了就照旧记，别把记忆搞没了
+            # ★ 2026-11-14：只用 is_at_or_wake_command。
+            #   以前还要 or event.is_wake_up()，但本插件注册了 event_message_type 监听器，
+            #   框架会把每条消息的 is_wake 置真（AstrMessageEvent 里有注释说明），
+            #   于是这个分支恒真、triggered 退化成 all，等于这个开关完全失效。
+            woke = bool(getattr(event, "is_at_or_wake_command", False))
             if not woke:
                 return "record_scope=triggered（这条没唤醒 bot）"
 
@@ -996,28 +1012,34 @@ class SmartMemory(Star):
             #   body 会被 cap 截断，若水位线仍取整批的最大 id，被截掉的消息就
             #   **从没进过模型却被删了**（调小 organize_max_chars 时特别容易踩）。
             #   这里逐行累加，记下最后一行装进去的 id 当水位线，剩下的留在缓冲里下轮再处理。
-            picked, used, last_id = [], 0, 0
+            picked, used = [], 0
             for r in msgs:
                 line = f"{(r['user_name'] or '').strip() or r['user_id']}: {r['content']}"
                 if used + len(line) + 1 > cap - 400 and picked:   # 留 400 字给开头的对照表
                     break
                 picked.append((r, line))
                 used += len(line) + 1
-                last_id = int(r["id"])
-            speakers, seen_qq = [], set()
-            for r, _line in picked:
-                u = str(r["user_id"] or "")
-                n = (r["user_name"] or "").strip() or u
-                if u and u != "system" and u not in seen_qq:
-                    seen_qq.add(u)
-                    speakers.append((n, u))
-            roster = "；".join(f"{n}={u}" for n, u in speakers[:80])
-            text = ("【群成员QQ对照】" + roster + "\n\n"
-                    + "\n".join(line for _r, line in picked))[:cap]
-            if last_id:
-                watermark = last_id
-            else:                      # 一行都装不下就宁可不删
-                watermark = 0
+            # ★ 2026-11-14：以前先拼好 text 再 [:cap] 截断，水位线却按截断前算，
+            #   被切掉的那几行从没进过模型却被清掉了。现在反过来：先算清真正的长度，
+            #   一行一行从尾部退，退到装得下为止，水位线只认最后留下的那行。
+            def _assemble(rows):
+                speakers, seen = [], set()
+                for r, _line in rows:
+                    u = str(r["user_id"] or "")
+                    n = (r["user_name"] or "").strip() or u
+                    if u and u != "system" and u not in seen:
+                        seen.add(u)
+                        speakers.append((n, u))
+                roster = "；".join(f"{n}={u}" for n, u in speakers[:80])
+                body = "\n".join(line for _r, line in rows)
+                head = "【群成员QQ对照】" + roster + "\n\n"
+                return head, body
+            
+            while picked and len(_assemble(picked)[0]) + len(_assemble(picked)[1]) > cap:
+                picked.pop()
+            head, body = _assemble(picked) if picked else ("", "")
+            text = head + body
+            watermark = int(picked[-1][0]["id"]) if picked else 0
             self._log(
                 f"[{self._log_tag(self_id)}] 本次整理喂入 {len(picked)}/{len(msgs)} 条"
                 f"（{len(text)} 字），水位线 id={watermark}"
@@ -1334,8 +1356,17 @@ class SmartMemory(Star):
         不数机器人自己说的话：那些行不进提炼（见 `_all_short`），
         数进去会导致"凑够 100 条该整理了"，取出来过滤后却不够，整理被反复空跑。
         """
+        # ★ record_scope=bot 时缓冲里只有机器人自己的行，再按「排除 self」去数
+        #   永远是 0，等于这个模式永不整理（死配置）。所以这里跟着模式翻面。
+        bot_only = str(self.config.get("record_scope", "all") or "all").strip().lower() == "bot"
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
+                if bot_only:
+                    return conn.execute(
+                        "SELECT COUNT(*) FROM short_term WHERE group_id = ? AND expire_at > ? "
+                        "AND user_id = ?",
+                        (group_id, time.time(), str(self_id)),
+                    ).fetchone()[0]
                 return conn.execute(
                     "SELECT COUNT(*) FROM short_term WHERE group_id = ? AND expire_at > ? "
                     "AND user_id != ?",
@@ -1352,8 +1383,15 @@ class SmartMemory(Star):
         长期记忆的，把它自己的复读也喂进去，几轮之后记忆里就全是自我回音，
         真事反而被挤掉。机器人自己说的那句仍然留在表里，供「昨天你怎么答的」用。
         """
+        bot_only = str(self.config.get("record_scope", "all") or "all").strip().lower() == "bot"
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
+                if bot_only:
+                    return conn.execute(
+                        "SELECT * FROM short_term WHERE group_id = ? AND expire_at > ? "
+                        "AND user_id = ? ORDER BY created_at ASC LIMIT ?",
+                        (group_id, time.time(), str(self_id), limit),
+                    ).fetchall()
                 if include_self:
                     return conn.execute(
                         "SELECT * FROM short_term WHERE group_id = ? AND expire_at > ? "
@@ -2358,10 +2396,14 @@ class SmartMemory(Star):
             text = " / ".join(bits).strip()
             if not text or len(text) > 400:
                 return
-            if text.startswith(("/mem", "/天气", "/塔罗", "/灵签")):
-                return
             self_id = str(event.get_self_id())
             group_id = self._get_scope(event)
+            # ★ 2026-11-14：这里原来只看 record_bot_reply，绕过了 disabled_scopes，
+            #   于是「完全不记」的群仍会持续写入机器人回复，还会被注入。
+            if self._scope_disabled(group_id):
+                return
+            if text.startswith(("/mem", "/天气", "/塔罗", "/灵签")):
+                return
             self._ensure_db(self_id)
             name = self._bot_name(self_id) or "我"
             self._add_short(self_id, group_id, self_id, name, text)
@@ -2374,6 +2416,9 @@ class SmartMemory(Star):
             if event.get_message_type() not in (MessageType.GROUP_MESSAGE, MessageType.FRIEND_MESSAGE):
                 return
             group_id = self._get_scope(event)
+            # 被禁用的作用域不注入：既然说了不记，就别再把别人的记忆喂给它
+            if self._scope_disabled(group_id):
+                return
             self_id = str(event.get_self_id())
             query = event.get_message_str().strip()
             if not query:
@@ -2428,7 +2473,14 @@ class SmartMemory(Star):
                         for r in own:
                             if r["id"] in dup:
                                 continue
-                            body = self._profile_for_inject(r, cap)
+                            # ★ 2026-11-14：_member_rows 除了画像行还会返回要点行，
+                            #   而 _profile_for_inject 会按「：」「；」「=」拆键值重拼。
+                            #   实测一条要点被改写成「【画像】群聊记录：…」，身份错了；
+                            #   不含「=」的要点则被当成空壳整条丢掉。这里按行类型分开处理。
+                            if _is_profile_row(r):
+                                body = self._profile_for_inject(r, cap)
+                            else:
+                                body = _clip(str(r["content"] or ""), cap)
                             if not body:      # 空壳 / 动态键全过期 → 不带这条
                                 continue
                             when = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d")
@@ -2491,17 +2543,18 @@ class SmartMemory(Star):
 
     # ---------------- 指令 ----------------
     def _vacuum_vectors(self, self_id: str) -> str:
-        """语义召回没开时，long_term_vec 里的向量没人读，清掉能省几十兆。
+        """语义召回关着时，long_term_vec 里的向量没人读，清掉能省几十兆。
     
-        只负责删数据。机器人开着这个库时 VACUUM 常拿不到独占锁，压不动就照实说，
-        让用户重启一次插件再清。
+        判开关用 _semantic_mode()（合法值 off/auto/always），别自己解析字符串：
+        以前写成 on/true 才算开，于是 auto/always 也会被当成关，把正在用的向量删光。
         """
         try:
-            flag = str(self.config.get("semantic_recall", "off") or "off").strip().lower()
+            mode = self._semantic_mode()
         except Exception:
-            flag = "off"
-        if flag in ("on", "true", "1", "yes", "开"):
-            return "语义召回开着，向量还要用，这次不清。\n想清就把 semantic_recall 设成 off 再发一次。"
+            mode = "off"
+        if mode != "off":
+            return (f"语义召回当前是 {mode}，向量还要用，这次不清。\n"
+                    "确实想清就先在配置里把 semantic_recall 改成 off。")
         path = self._db_path(self_id)
         try:
             with closing(self._connect(path)) as conn:
@@ -2511,7 +2564,7 @@ class SmartMemory(Star):
                 conn.execute("DELETE FROM long_term_vec")
                 conn.commit()
                 try:
-                    conn.execute("PRAGMA temp_store=MEMORY")  # 默认临时目录写不进时 VACUUM 会失败
+                    conn.execute("PRAGMA temp_store=MEMORY")
                     conn.execute("VACUUM")
                     shrunk = True
                 except Exception:
