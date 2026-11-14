@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.12.1] - 2026-11-14
+
+第三轮复审（两个代理独立查）后的收尾。
+
+### 修复
+- **`/mem models` 必崩**：`m = p.meta` 漏了括号。`meta` 在 AstrBot 4.28 是方法，
+  这一行必然 `AttributeError`，且该分支没有 try 兜底。其余 6 处调用点都是对的。
+- **「昨天」升为独立层级 L3Y**：原来落在三天桶里，问昨天会把前天一起带回来。
+  现在窗口是昨天 00:00 ~ 今天 00:00。
+- **私聊周一「本周」空窗口**：周一当天 `week_start == today`，私聊把终点压到今天 0 点
+  就成了空区间，问「本周」什么都拿不到。现在这种时候终点放回「现在」。
+- **roster 关闭时 prompt 自相矛盾**：正文里不提对照表了，但提示词还写着
+  「开头是一张【群成员QQ对照】表」，可能诱导模型编造 QQ 号（正文里的 `QQ=` 会被
+  当成分组锚点）。现在按开关切换措辞。
+- **`_parse_json` 收到数组**：返回 None 而不是 list，避免调用点 `data.get` 抛异常后
+  表现为"整理失败 + 退避"。
+
+### 变更
+- 后台任务全部收进 `_tasks`（原先 organize / embed 两处 create_task 没收引用）；
+  `terminate` 取消后 `asyncio.wait(tasks, timeout=3)`，承认 `to_thread` 里的活取消不掉。
+- `on_bot_reply` 补消息类型守卫，避免把 OTHER_MESSAGE 记进 `priv_<sender>`。
+- `profile_max_chars` 代码兜底 80 → 120，与 schema 一致。
+- 清掉几处残留：`watermark` 死赋值、`max(0.62, 0.0)`、冗余 `except (TimeoutError, Exception)`、
+  `if ... and not event.is_admin()`（上调已强制管理员，恒假）。
+
 ## [1.12.0] - 2026-11-14
 
 审查最后一批：启动、解析、注入兜底。
