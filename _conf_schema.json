@@ -209,5 +209,11 @@
     "hint": "默认自动用 AstrBot 里该 bot 的平台实例名（就是 unified_msg_origin 的前缀，例如「甲」「乙」），日志标签和落库的 user_name 都用它。若实例名不好看，可在这里显式指定，格式：QQ号=名字，多个用逗号隔开。例：10001=甲, 10002=乙",
     "type": "string",
     "default": ""
+  },
+  "record_bot_reply": {
+    "type": "bool",
+    "description": "记录机器人自己的回复",
+    "default": true,
+    "hint": "开着才能回答「昨天你怎么说的」这类问题；关掉只记用户说的话。"
   }
 }
