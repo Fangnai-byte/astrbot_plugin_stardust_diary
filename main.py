@@ -2316,6 +2316,38 @@ class SmartMemory(Star):
         return merged[:top_k]
 
     # ---------------- 注入上下文 ----------------
+    @filter.on_decorating_result()
+    async def on_bot_reply(self, event: AstrMessageEvent):
+        """把机器人发出去的话也记进短期缓冲。
+
+        以前只记用户说的，于是「昨天怎么了吗」能答出你问过什么，答不出它当时怎么回的。
+        只收纯文本段，指令回执（/mem、/天气 这类）和空消息跳过。
+        """
+        try:
+            if not bool(self.config.get("record_bot_reply", True)):
+                return
+            result = event.get_result()
+            if result is None:
+                return
+            chain = getattr(result, "chain", None) or []
+            bits = []
+            for seg in chain:
+                text = getattr(seg, "text", None)
+                if isinstance(text, str) and text.strip():
+                    bits.append(text.strip())
+            text = " / ".join(bits).strip()
+            if not text or len(text) > 400:
+                return
+            if text.startswith(("/mem", "/天气", "/塔罗", "/灵签")):
+                return
+            self_id = str(event.get_self_id())
+            group_id = self._get_scope(event)
+            self._ensure_db(self_id)
+            name = self._bot_name(self_id) or "我"
+            self._add_short(self_id, group_id, self_id, name, text)
+        except Exception as exc:
+            logger.debug(f"[SmartMemory] 记录机器人回复失败: {exc}")
+
     @filter.on_llm_request()
     async def on_llm_req(self, event: AstrMessageEvent, req: ProviderRequest):
         try:
