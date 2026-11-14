@@ -221,5 +221,11 @@
     "description": "整理时把「昵称=QQ」对照表发给模型",
     "default": true,
     "hint": "关掉后 prompt 里不再出现真实 QQ 号（少外发身份信息），代价是画像里不再自动写 QQ 键。"
+  },
+  "embed_max_per_run": {
+    "type": "int",
+    "description": "单次补向量的总量上限",
+    "default": 2000,
+    "hint": "打开语义召回时会从最旧往新补向量；这个上限防止一次补完整库。"
   }
 }
