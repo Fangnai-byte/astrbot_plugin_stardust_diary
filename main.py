@@ -1338,13 +1338,26 @@ class SmartMemory(Star):
         except Exception:
             return 0
 
-    def _all_short(self, self_id: str, group_id: str, limit: int = 500):
+    def _all_short(self, self_id: str, group_id: str, limit: int = 500,
+                   include_self: bool = False):
+        """取缓冲里的消息。
+
+        include_self=False（默认）时跳过机器人自己发的话：这批消息是拿去提炼
+        长期记忆的，把它自己的复读也喂进去，几轮之后记忆里就全是自我回音，
+        真事反而被挤掉。机器人自己说的那句仍然留在表里，供「昨天你怎么答的」用。
+        """
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
+                if include_self:
+                    return conn.execute(
+                        "SELECT * FROM short_term WHERE group_id = ? AND expire_at > ? "
+                        "ORDER BY created_at ASC LIMIT ?",
+                        (group_id, time.time(), limit),
+                    ).fetchall()
                 return conn.execute(
                     "SELECT * FROM short_term WHERE group_id = ? AND expire_at > ? "
-                    "ORDER BY created_at ASC LIMIT ?",
-                    (group_id, time.time(), limit),
+                    "AND user_id != ? ORDER BY created_at ASC LIMIT ?",
+                    (group_id, time.time(), str(self_id), limit),
                 ).fetchall()
         except Exception:
             return []
