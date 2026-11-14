@@ -517,6 +517,14 @@ class SmartMemory(Star):
             + ("、".join(_PROFILE_NAMES) if _PROFILE_NAMES else "（无）")
         )
         # 把"省 token 的当前策略"落到日志里，出问题时一眼能看出配置有没有生效
+        # opencc 没装时 _norm() 是恒等函数，繁简写法不同的记忆召不回，
+        # 但整条链路不报错，只能靠这行日志让人知道。
+        if _T2S is None:
+            logger.warning(
+                "[SmartMemory] opencc 未安装：繁简归一化不生效，"
+                "简繁写法不同的记忆可能召不回"
+                "（pip install opencc-python-reimplemented）"
+            )
         self._log(
             "[{0}] 缓冲策略: record_scope={1}、min_msg_chars={2}、禁用作用域={3}、"
             "单次整理上限={4}字；注入 top_k={5}、画像≤{6}字、本人画像注入={7}".format(
@@ -599,7 +607,14 @@ class SmartMemory(Star):
         #   temp_store=memory —— 排序/去重不走临时文件。
         #     临时文件建不出来时 SQLite 报的是 "unable to open database file"，
         #     和"库打不开"同一个措辞，很容易误判成库坏了（qzone_publish 那边踩过）。
-        for pragma in ("pragma busy_timeout = 10000", "pragma temp_store = memory"):
+        #   journal_mode=WAL —— 以前是 delete 模式，读写互斥：每轮 LLM 请求的只读检索
+        #     会和整理写入互相顶，VACUUM 更是不可能拿到锁。WAL 是持久属性，设一次即可。
+        for pragma in (
+            "pragma busy_timeout = 10000",
+            "pragma temp_store = memory",
+            "pragma journal_mode = WAL",
+            "pragma synchronous = NORMAL",
+        ):
             try:
                 conn.execute(pragma)
             except Exception:  # noqa: BLE001
@@ -624,6 +639,10 @@ class SmartMemory(Star):
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_long_group ON long_term(group_id)")
+        # 热查询是「按群取最近 N 条」和「按过期时间清理」，单列索引帮不上排序和范围扫描
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_long_group_time ON long_term(group_id, created_at)"
+        )
         # 老库升级：补 kv_ts 列（每个画像键"最后一次被更新"的时间戳，JSON）
         try:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(long_term)")}
@@ -646,6 +665,12 @@ class SmartMemory(Star):
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_short_group ON short_term(group_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_group_time ON short_term(group_id, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_short_expire ON short_term(expire_at)"
+        )
         # 语义召回用的向量表（可选功能：没配嵌入模型时它一直是空的，不影响其它逻辑）
         conn.execute(
             """
@@ -1049,7 +1074,7 @@ class SmartMemory(Star):
             if provider is None:
                 self._organize_backoff[job_key] = time.time()
                 return
-            resp = await provider.text_chat(
+            resp = await asyncio.wait_for(provider.text_chat(
                 prompt=text,
                 system_prompt=(
                     "你是群聊档案管理员。根据聊天记录做两件事：\n"
@@ -1064,11 +1089,11 @@ class SmartMemory(Star):
                     + (f"\n\n额外要求：{self.config.get('organize_prompt', '')}"
                        if self.config.get("organize_prompt", "") else "")
                 ),
-            )
+            ), timeout=120)
             out = "".join(
                 [c.text for c in (resp.result_chain.chain if resp.result_chain else []) if isinstance(c, Plain)]
             )
-            self._log(f"[{self._log_tag(self_id)}] LLM 返回前100字: {out[:100]!r}")
+            self._log(f"[{self._log_tag(self_id)}] LLM 返回 {len(out)} 字")
             data = self._parse_json(out)
             self._log(f"[{self._log_tag(self_id)}] 解析结果: {bool(data)}")
             if not data:
@@ -2167,31 +2192,50 @@ class SmartMemory(Star):
             return []
 
     def _since_ts(self, level: str) -> float:
-        """分层时间起点：L1长期全部 / L2今天 / L3最近三天 / L4本周一。"""
+        """兼容老调用：只取起点。"""
+        return self._time_window(level)[0]
+
+    def _time_window(self, level: str, private: bool = False):
+        """每一级的 (起点, 终点) 时间戳。
+
+        ★ 2026-11-14 重做：以前只有起点、没有终点，查询又是
+        ORDER BY created_at DESC LIMIT n，于是「昨天」「本周」拿到的还是最近几条；
+        「上周」被映射成本周一，上周内容整个在窗口外；私聊 L3/L4 含今天，
+        今天的话又被注一遍。现在每级都给上下界，私聊再把终点压到今天 0 点。
+        """
         now = datetime.now()
+        today = datetime(now.year, now.month, now.day)
         if level == "L2":
-            return datetime(now.year, now.month, now.day).timestamp()
+            return today.timestamp(), now.timestamp()
         if level == "L3":
-            return (now - timedelta(days=3)).timestamp()
+            return (today - timedelta(days=3)).timestamp(), (today if private else now).timestamp()
         if level == "L4":
-            week_start = (now - timedelta(days=now.weekday())).replace(
-                hour=0, minute=0, second=0, microsecond=0
-            )
-            return week_start.timestamp()
-        return 0.0  # L1：全部长期记忆
+            week_start = today - timedelta(days=now.weekday())
+            return week_start.timestamp(), (today if private else now).timestamp()
+        if level == "L5":
+            this_monday = today - timedelta(days=now.weekday())
+            return (this_monday - timedelta(days=7)).timestamp(), this_monday.timestamp()
+        return 0.0, now.timestamp()
 
     def _detect_time_intent(self, query: str) -> str | None:
-        """根据提问内容判断时间层级意图。"""
-        if any(k in query for k in ("今天", "刚刚", "刚才", "此刻", "现在", "今早", "今晨",
-                                    "今晚", "今夜", "今儿", "早上", "上午", "下午", "中午", "晚上")):
-            return "L2"
-        if any(k in query for k in ("最近", "这两天", "这几天", "前两天", "前天", "大前天",
-                                    "昨天", "昨晚", "昨日", "昨夜")):
-            return "L3"
-        if any(k in query for k in ("本周", "这周", "这星期", "这个星期", "星期", "一周", "上周")):
-            return "L4"
-        return None
+        """判断提问指的时间层级。
 
+        ★ 顺序很重要：以前「今天/晚上/下午」排最前，于是「昨天晚上怎么了」
+        被判成今天、昨晚消息全在窗口外。现在先认远指。
+        """
+        q = query or ""
+        if any(k in q for k in ("上周", "上个星期", "上星期", "上礼拜")):
+            return "L5"
+        if any(k in q for k in ("昨天", "昨晚", "昨日", "昨夜", "前天", "大前天", "前晚")):
+            return "L3"
+        if any(k in q for k in ("最近", "这两天", "这几天", "前两天")):
+            return "L3"
+        if any(k in q for k in ("本周", "这周", "这星期", "这个星期", "一周", "星期")):
+            return "L4"
+        if any(k in q for k in ("今天", "刚刚", "刚才", "此刻", "现在", "今早", "今晨",
+                               "今晚", "今夜", "今儿", "早上", "上午", "下午", "中午", "晚上")):
+            return "L2"
+        return None
     @staticmethod
     def _now_str() -> str:
         """当前时间锚点，供模型换算“今天/昨天/最近”。"""
@@ -2243,13 +2287,20 @@ class SmartMemory(Star):
         # 动态键被 TTL 全丢光时 _pack_profile 会剩一个「【画像】甲：」的空壳，直接当没有
         return body if "=" in body else ""
 
-    def _recent_short_since(self, self_id: str, group_id: str, since_ts: float, n: int = 10):
+    def _recent_short_since(self, self_id: str, group_id: str, since_ts: float,
+                            n: int = 10, until_ts: float | None = None):
+        """取 [since, until) 区间内的消息；until 缺省到「现在」。
+    
+        没有上界时，「昨天」「本周」会一直取到最新几条，名不副实。
+        """
+        until = time.time() if until_ts is None else until_ts
         try:
             with closing(self._connect(self._db_path(self_id))) as conn:
                 return conn.execute(
                     "SELECT * FROM short_term WHERE group_id = ? AND created_at >= ? "
-                    "AND expire_at > ? ORDER BY created_at DESC LIMIT ?",
-                    (group_id, since_ts, time.time(), n),
+                    "AND created_at < ? AND expire_at > ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (group_id, since_ts, until, time.time(), n),
                 ).fetchall()
         except Exception:
             return []
@@ -2501,10 +2552,10 @@ class SmartMemory(Star):
             if level == "L2" and group_id.startswith("priv_"):
                 level = None
             if level:
-                since = self._since_ts(level)
+                start_ts, end_ts = self._time_window(level, private=str(group_id).startswith("priv_"))
                 n = int(self.config.get("recent_count", 5)) * 2
-                rows = self._recent_short_since(self_id, group_id, since, n)
-                label = {"L2": "今天", "L3": "最近三天", "L4": "本周"}.get(level, level)
+                rows = self._recent_short_since(self_id, group_id, start_ts, n, end_ts)
+                label = {"L2": "今天", "L3": "最近三天", "L4": "本周", "L5": "上周"}.get(level, level)
                 if rows:
                     lines = [
                         f"- {datetime.fromtimestamp(r['created_at']).strftime('%m-%d %H:%M')} "
