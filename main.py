@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.event.filter import EventMessageType, PermissionType
+from astrbot.api.event.filter import EventMessageType
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
@@ -2490,7 +2490,6 @@ class SmartMemory(Star):
             logger.warning(f"[SmartMemory] 注入记忆失败: {e}")
 
     # ---------------- 指令 ----------------
-    @filter.permission_type(PermissionType.ADMIN)
     def _vacuum_vectors(self, self_id: str) -> str:
         """语义召回没开时，long_term_vec 里的向量没人读，清掉能省几十兆。
     
