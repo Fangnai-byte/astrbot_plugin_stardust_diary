@@ -2391,7 +2391,10 @@ class SmartMemory(Star):
             #   这段记录是同一段对话的原样重复（实测「今天没有雨啦」被塞进 10 条/409 字，
             #   而它本来就在上下文里）。群聊仍然需要——群里 bot 只看得到被唤醒那几条。
             level = self._detect_time_intent(query)
-            if level and group_id.startswith("priv_"):
+            # ★ 2026-11-08：私聊以前整段跳过，理由是"上下文里本来就有今天的消息"。
+            #   那只对今天成立：问「昨天」「前天」时，上下文里没有，记忆里也是摘要，
+            #   于是它只能答"记不清"。现在只跳过 L2（今天），三天内和本周照常注入。
+            if level == "L2" and group_id.startswith("priv_"):
                 level = None
             if level:
                 since = self._since_ts(level)
