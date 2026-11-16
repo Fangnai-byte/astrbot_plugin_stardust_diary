@@ -932,7 +932,9 @@ class SmartMemory(Star):
             #   以前还要 or event.is_wake_up()，但本插件注册了 event_message_type 监听器，
             #   框架会把每条消息的 is_wake 置真（AstrMessageEvent 里有注释说明），
             #   于是这个分支恒真、triggered 退化成 all，等于这个开关完全失效。
-            woke = bool(getattr(event, "is_at_or_wake_command", False))
+            _woke = getattr(event, "is_at_or_wake_command", False)
+            # 4.28 里它是 bool 属性；万一某版本改成方法，bool(方法) 恒真会再次让开关失效
+            woke = bool(_woke() if callable(_woke) else _woke)
             if not woke:
                 return "record_scope=triggered（这条没唤醒 bot）"
 
@@ -2521,6 +2523,22 @@ class SmartMemory(Star):
         return merged[:top_k]
 
     # ---------------- 注入上下文 ----------------
+    def _last_bot_line_same(self, self_id: str, group_id: str, text: str,
+                            window: float = 15.0) -> bool:
+        """最近 window 秒内，这个作用域是否刚存过一模一样的机器人回复。"""
+        try:
+            with closing(self._connect(self._db_path(self_id))) as conn:
+                row = conn.execute(
+                    "SELECT content, created_at FROM short_term WHERE group_id = ? "
+                    "AND user_id = ? ORDER BY created_at DESC LIMIT 1",
+                    (group_id, str(self_id)),
+                ).fetchone()
+        except Exception:
+            return False
+        if not row:
+            return False
+        return str(row[0] or "") == text and (time.time() - float(row[1] or 0)) < window
+
     @filter.on_decorating_result()
     async def on_bot_reply(self, event: AstrMessageEvent):
         """把机器人发出去的话也记进短期缓冲。
@@ -2559,6 +2577,9 @@ class SmartMemory(Star):
             if asked[:1] in ("/", "／"):
                 return
             self._ensure_db(self_id)
+            # 同一条回复可能被重复装饰（重试 / 别的插件改写结果），15 秒内同内容只记一次
+            if self._last_bot_line_same(self_id, group_id, text):
+                return
             name = self._bot_name(self_id) or "我"
             self._add_short(self_id, group_id, self_id, name, text)
         except Exception as exc:
